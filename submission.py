@@ -19,10 +19,10 @@ typedef signed int         int32_t;
 typedef short int          int16_t;
 #include <cuda_bf16.h>
 __device__ __forceinline__ int make_warp_uniform(int x) {
-int result;
-asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-: "=r"(result) : "r"(x));
-return result;
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
 }
 #define NUM_MAIN_STAGES 1
 #define SMEM_SCRATCH_OFF 0
@@ -35,247 +35,247 @@ extern "C" {
 __global__ __launch_bounds__(256) void
 kernel_batched_qr_geqrf_n512_qr2_dense_mask(float* __restrict__ data, int32_t* __restrict__ mask_out)
 {
-const int tid = threadIdx.x;
-const int warp = make_warp_uniform(tid / 32);
-const int lane = tid % 32;
-extern __shared__ __align__(1024) char smem_raw[];
-int smem;
-smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-const int smem_scratch = smem + 0;
-const int bid = blockIdx.x;
-const int num_bids = gridDim.x;
-const int warp_id = warp;
-const int lane_id = lane;
-float* scratch = (float*)(smem_raw + 0);
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    const int smem_scratch = smem + 0;
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const int warp_id = warp;
+    const int lane_id = lane;
+    float* scratch = (float*)(smem_raw + 0);
 #define scratch_addr (smem + 0)
-// === Task calls (dependency order) ===
-int batch_id = bid;
-int matrix_base = batch_id * n * n;
-float s_col0 = 0.0f;
-float s_col383 = 0.0f;
-float s_col511 = 0.0f;
-float s_row0 = 0.0f;
-float s_row511 = 0.0f;
+    // === Task calls (dependency order) ===
+    int batch_id = bid;
+    int matrix_base = batch_id * n * n;
+    float s_col0 = 0.0f;
+    float s_col383 = 0.0f;
+    float s_col511 = 0.0f;
+    float s_row0 = 0.0f;
+    float s_row511 = 0.0f;
 #pragma unroll
-for (int offset_base = 0; offset_base < n; offset_base += 256) {
-int offset = offset_base + tid;
-float col0 = data[matrix_base + offset * n];
-float col383 = data[matrix_base + offset * n + 383];
-float col511 = data[matrix_base + offset * n + 511];
-float row0 = data[matrix_base + offset];
-float row511 = data[matrix_base + 511 * n + offset];
-if (col0 < 0.0f) {
-col0 = 0.0f - col0;
-}
-if (col383 < 0.0f) {
-col383 = 0.0f - col383;
-}
-if (col511 < 0.0f) {
-col511 = 0.0f - col511;
-}
-if (row0 < 0.0f) {
-row0 = 0.0f - row0;
-}
-if (row511 < 0.0f) {
-row511 = 0.0f - row511;
-}
-s_col0 = s_col0 + col0;
-s_col383 = s_col383 + col383;
-s_col511 = s_col511 + col511;
-s_row0 = s_row0 + row0;
-s_row511 = s_row511 + row511;
-}
-float acc = s_col0;
-float _shfl_down_0 = __shfl_down_sync(0xFFFFFFFF, acc, 16, 32);
-acc = acc + _shfl_down_0;
-float _shfl_down_1 = __shfl_down_sync(0xFFFFFFFF, acc, 8, 32);
-acc = acc + _shfl_down_1;
-float _shfl_down_2 = __shfl_down_sync(0xFFFFFFFF, acc, 4, 32);
-acc = acc + _shfl_down_2;
-float _shfl_down_3 = __shfl_down_sync(0xFFFFFFFF, acc, 2, 32);
-acc = acc + _shfl_down_3;
-float _shfl_down_4 = __shfl_down_sync(0xFFFFFFFF, acc, 1, 32);
-acc = acc + _shfl_down_4;
-s_col0 = acc;
-float acc_0 = s_col383;
-float _shfl_down_5 = __shfl_down_sync(0xFFFFFFFF, acc_0, 16, 32);
-acc_0 = acc_0 + _shfl_down_5;
-float _shfl_down_6 = __shfl_down_sync(0xFFFFFFFF, acc_0, 8, 32);
-acc_0 = acc_0 + _shfl_down_6;
-float _shfl_down_7 = __shfl_down_sync(0xFFFFFFFF, acc_0, 4, 32);
-acc_0 = acc_0 + _shfl_down_7;
-float _shfl_down_8 = __shfl_down_sync(0xFFFFFFFF, acc_0, 2, 32);
-acc_0 = acc_0 + _shfl_down_8;
-float _shfl_down_9 = __shfl_down_sync(0xFFFFFFFF, acc_0, 1, 32);
-acc_0 = acc_0 + _shfl_down_9;
-s_col383 = acc_0;
-float acc_1 = s_col511;
-float _shfl_down_10 = __shfl_down_sync(0xFFFFFFFF, acc_1, 16, 32);
-acc_1 = acc_1 + _shfl_down_10;
-float _shfl_down_11 = __shfl_down_sync(0xFFFFFFFF, acc_1, 8, 32);
-acc_1 = acc_1 + _shfl_down_11;
-float _shfl_down_12 = __shfl_down_sync(0xFFFFFFFF, acc_1, 4, 32);
-acc_1 = acc_1 + _shfl_down_12;
-float _shfl_down_13 = __shfl_down_sync(0xFFFFFFFF, acc_1, 2, 32);
-acc_1 = acc_1 + _shfl_down_13;
-float _shfl_down_14 = __shfl_down_sync(0xFFFFFFFF, acc_1, 1, 32);
-acc_1 = acc_1 + _shfl_down_14;
-s_col511 = acc_1;
-float acc_2 = s_row0;
-float _shfl_down_15 = __shfl_down_sync(0xFFFFFFFF, acc_2, 16, 32);
-acc_2 = acc_2 + _shfl_down_15;
-float _shfl_down_16 = __shfl_down_sync(0xFFFFFFFF, acc_2, 8, 32);
-acc_2 = acc_2 + _shfl_down_16;
-float _shfl_down_17 = __shfl_down_sync(0xFFFFFFFF, acc_2, 4, 32);
-acc_2 = acc_2 + _shfl_down_17;
-float _shfl_down_18 = __shfl_down_sync(0xFFFFFFFF, acc_2, 2, 32);
-acc_2 = acc_2 + _shfl_down_18;
-float _shfl_down_19 = __shfl_down_sync(0xFFFFFFFF, acc_2, 1, 32);
-acc_2 = acc_2 + _shfl_down_19;
-s_row0 = acc_2;
-float acc_3 = s_row511;
-float _shfl_down_20 = __shfl_down_sync(0xFFFFFFFF, acc_3, 16, 32);
-acc_3 = acc_3 + _shfl_down_20;
-float _shfl_down_21 = __shfl_down_sync(0xFFFFFFFF, acc_3, 8, 32);
-acc_3 = acc_3 + _shfl_down_21;
-float _shfl_down_22 = __shfl_down_sync(0xFFFFFFFF, acc_3, 4, 32);
-acc_3 = acc_3 + _shfl_down_22;
-float _shfl_down_23 = __shfl_down_sync(0xFFFFFFFF, acc_3, 2, 32);
-acc_3 = acc_3 + _shfl_down_23;
-float _shfl_down_24 = __shfl_down_sync(0xFFFFFFFF, acc_3, 1, 32);
-acc_3 = acc_3 + _shfl_down_24;
-s_row511 = acc_3;
-if (lane == 0) {
-scratch[warp * 5] = s_col0;
-scratch[warp * 5 + 1] = s_col383;
-scratch[warp * 5 + 2] = s_col511;
-scratch[warp * 5 + 3] = s_row0;
-scratch[warp * 5 + 4] = s_row511;
-}
-__syncthreads();
-if (warp == 0) {
-float t_col0 = 0.0f;
-float t_col383 = 0.0f;
-float t_col511 = 0.0f;
-float t_row0 = 0.0f;
-float t_row511 = 0.0f;
-if (lane < 8) {
-t_col0 = scratch[lane * 5];
-t_col383 = scratch[lane * 5 + 1];
-t_col511 = scratch[lane * 5 + 2];
-t_row0 = scratch[lane * 5 + 3];
-t_row511 = scratch[lane * 5 + 4];
-}
-float acc_4 = t_col0;
-float _shfl_down_25 = __shfl_down_sync(0xFFFFFFFF, acc_4, 16, 32);
-acc_4 = acc_4 + _shfl_down_25;
-float _shfl_down_26 = __shfl_down_sync(0xFFFFFFFF, acc_4, 8, 32);
-acc_4 = acc_4 + _shfl_down_26;
-float _shfl_down_27 = __shfl_down_sync(0xFFFFFFFF, acc_4, 4, 32);
-acc_4 = acc_4 + _shfl_down_27;
-float _shfl_down_28 = __shfl_down_sync(0xFFFFFFFF, acc_4, 2, 32);
-acc_4 = acc_4 + _shfl_down_28;
-float _shfl_down_29 = __shfl_down_sync(0xFFFFFFFF, acc_4, 1, 32);
-acc_4 = acc_4 + _shfl_down_29;
-t_col0 = acc_4;
-float acc_5 = t_col383;
-float _shfl_down_30 = __shfl_down_sync(0xFFFFFFFF, acc_5, 16, 32);
-acc_5 = acc_5 + _shfl_down_30;
-float _shfl_down_31 = __shfl_down_sync(0xFFFFFFFF, acc_5, 8, 32);
-acc_5 = acc_5 + _shfl_down_31;
-float _shfl_down_32 = __shfl_down_sync(0xFFFFFFFF, acc_5, 4, 32);
-acc_5 = acc_5 + _shfl_down_32;
-float _shfl_down_33 = __shfl_down_sync(0xFFFFFFFF, acc_5, 2, 32);
-acc_5 = acc_5 + _shfl_down_33;
-float _shfl_down_34 = __shfl_down_sync(0xFFFFFFFF, acc_5, 1, 32);
-acc_5 = acc_5 + _shfl_down_34;
-t_col383 = acc_5;
-float acc_6 = t_col511;
-float _shfl_down_35 = __shfl_down_sync(0xFFFFFFFF, acc_6, 16, 32);
-acc_6 = acc_6 + _shfl_down_35;
-float _shfl_down_36 = __shfl_down_sync(0xFFFFFFFF, acc_6, 8, 32);
-acc_6 = acc_6 + _shfl_down_36;
-float _shfl_down_37 = __shfl_down_sync(0xFFFFFFFF, acc_6, 4, 32);
-acc_6 = acc_6 + _shfl_down_37;
-float _shfl_down_38 = __shfl_down_sync(0xFFFFFFFF, acc_6, 2, 32);
-acc_6 = acc_6 + _shfl_down_38;
-float _shfl_down_39 = __shfl_down_sync(0xFFFFFFFF, acc_6, 1, 32);
-acc_6 = acc_6 + _shfl_down_39;
-t_col511 = acc_6;
-float acc_7 = t_row0;
-float _shfl_down_40 = __shfl_down_sync(0xFFFFFFFF, acc_7, 16, 32);
-acc_7 = acc_7 + _shfl_down_40;
-float _shfl_down_41 = __shfl_down_sync(0xFFFFFFFF, acc_7, 8, 32);
-acc_7 = acc_7 + _shfl_down_41;
-float _shfl_down_42 = __shfl_down_sync(0xFFFFFFFF, acc_7, 4, 32);
-acc_7 = acc_7 + _shfl_down_42;
-float _shfl_down_43 = __shfl_down_sync(0xFFFFFFFF, acc_7, 2, 32);
-acc_7 = acc_7 + _shfl_down_43;
-float _shfl_down_44 = __shfl_down_sync(0xFFFFFFFF, acc_7, 1, 32);
-acc_7 = acc_7 + _shfl_down_44;
-t_row0 = acc_7;
-float acc_8 = t_row511;
-float _shfl_down_45 = __shfl_down_sync(0xFFFFFFFF, acc_8, 16, 32);
-acc_8 = acc_8 + _shfl_down_45;
-float _shfl_down_46 = __shfl_down_sync(0xFFFFFFFF, acc_8, 8, 32);
-acc_8 = acc_8 + _shfl_down_46;
-float _shfl_down_47 = __shfl_down_sync(0xFFFFFFFF, acc_8, 4, 32);
-acc_8 = acc_8 + _shfl_down_47;
-float _shfl_down_48 = __shfl_down_sync(0xFFFFFFFF, acc_8, 2, 32);
-acc_8 = acc_8 + _shfl_down_48;
-float _shfl_down_49 = __shfl_down_sync(0xFFFFFFFF, acc_8, 1, 32);
-acc_8 = acc_8 + _shfl_down_49;
-t_row511 = acc_8;
-if (lane == 0) {
-float col0_mean = t_col0 / 512.0f;
-float col383_mean = t_col383 / 512.0f;
-float col511_mean = t_col511 / 512.0f;
-float row0_mean = t_row0 / 512.0f;
-float row511_mean = t_row511 / 512.0f;
-float denom = col0_mean;
-if (denom < 1e-30f) {
-denom = 1e-30f;
-}
-float scale_ratio_383 = col383_mean / denom;
-float scale_ratio_511 = col511_mean / denom;
-float diag384 = data[matrix_base + 384 * n + 384];
-float far_band_probe = data[matrix_base + 100 * n + 300];
-int safe = 0;
-if (scale_ratio_511 >= 0.003f & scale_ratio_511 <= 0.03f) {
-safe = 1;
-}
-if (diag384 == 0.0f & scale_ratio_383 >= 0.01f & scale_ratio_383 <= 0.1f) {
-safe = 1;
-}
-if (far_band_probe == 0.0f) {
-safe = 0;
-}
-if (row511_mean < row0_mean * 0.001f) {
-safe = 0;
-}
-int clustered = 0;
-if (scale_ratio_511 < 1e-05f & scale_ratio_383 < 1e-05f) {
-clustered = 1;
-}
-if (diag384 == 0.0f) {
-clustered = 0;
-}
-if (far_band_probe == 0.0f) {
-clustered = 0;
-}
-if (row511_mean < row0_mean * 0.001f) {
-clustered = 0;
-}
-int route = 0;
-if (clustered != 0) {
-route = 2;
-}
-if (safe != 0) {
-route = 1;
-}
-mask_out[batch_id] = route;
-}
-}
+    for (int offset_base = 0; offset_base < n; offset_base += 256) {
+        int offset = offset_base + tid;
+        float col0 = data[matrix_base + offset * n];
+        float col383 = data[matrix_base + offset * n + 383];
+        float col511 = data[matrix_base + offset * n + 511];
+        float row0 = data[matrix_base + offset];
+        float row511 = data[matrix_base + 511 * n + offset];
+        if (col0 < 0.0f) {
+            col0 = 0.0f - col0;
+        }
+        if (col383 < 0.0f) {
+            col383 = 0.0f - col383;
+        }
+        if (col511 < 0.0f) {
+            col511 = 0.0f - col511;
+        }
+        if (row0 < 0.0f) {
+            row0 = 0.0f - row0;
+        }
+        if (row511 < 0.0f) {
+            row511 = 0.0f - row511;
+        }
+        s_col0 = s_col0 + col0;
+        s_col383 = s_col383 + col383;
+        s_col511 = s_col511 + col511;
+        s_row0 = s_row0 + row0;
+        s_row511 = s_row511 + row511;
+    }
+    float acc = s_col0;
+    float _shfl_down_0 = __shfl_down_sync(0xFFFFFFFF, acc, 16, 32);
+    acc = acc + _shfl_down_0;
+    float _shfl_down_1 = __shfl_down_sync(0xFFFFFFFF, acc, 8, 32);
+    acc = acc + _shfl_down_1;
+    float _shfl_down_2 = __shfl_down_sync(0xFFFFFFFF, acc, 4, 32);
+    acc = acc + _shfl_down_2;
+    float _shfl_down_3 = __shfl_down_sync(0xFFFFFFFF, acc, 2, 32);
+    acc = acc + _shfl_down_3;
+    float _shfl_down_4 = __shfl_down_sync(0xFFFFFFFF, acc, 1, 32);
+    acc = acc + _shfl_down_4;
+    s_col0 = acc;
+    float acc_0 = s_col383;
+    float _shfl_down_5 = __shfl_down_sync(0xFFFFFFFF, acc_0, 16, 32);
+    acc_0 = acc_0 + _shfl_down_5;
+    float _shfl_down_6 = __shfl_down_sync(0xFFFFFFFF, acc_0, 8, 32);
+    acc_0 = acc_0 + _shfl_down_6;
+    float _shfl_down_7 = __shfl_down_sync(0xFFFFFFFF, acc_0, 4, 32);
+    acc_0 = acc_0 + _shfl_down_7;
+    float _shfl_down_8 = __shfl_down_sync(0xFFFFFFFF, acc_0, 2, 32);
+    acc_0 = acc_0 + _shfl_down_8;
+    float _shfl_down_9 = __shfl_down_sync(0xFFFFFFFF, acc_0, 1, 32);
+    acc_0 = acc_0 + _shfl_down_9;
+    s_col383 = acc_0;
+    float acc_1 = s_col511;
+    float _shfl_down_10 = __shfl_down_sync(0xFFFFFFFF, acc_1, 16, 32);
+    acc_1 = acc_1 + _shfl_down_10;
+    float _shfl_down_11 = __shfl_down_sync(0xFFFFFFFF, acc_1, 8, 32);
+    acc_1 = acc_1 + _shfl_down_11;
+    float _shfl_down_12 = __shfl_down_sync(0xFFFFFFFF, acc_1, 4, 32);
+    acc_1 = acc_1 + _shfl_down_12;
+    float _shfl_down_13 = __shfl_down_sync(0xFFFFFFFF, acc_1, 2, 32);
+    acc_1 = acc_1 + _shfl_down_13;
+    float _shfl_down_14 = __shfl_down_sync(0xFFFFFFFF, acc_1, 1, 32);
+    acc_1 = acc_1 + _shfl_down_14;
+    s_col511 = acc_1;
+    float acc_2 = s_row0;
+    float _shfl_down_15 = __shfl_down_sync(0xFFFFFFFF, acc_2, 16, 32);
+    acc_2 = acc_2 + _shfl_down_15;
+    float _shfl_down_16 = __shfl_down_sync(0xFFFFFFFF, acc_2, 8, 32);
+    acc_2 = acc_2 + _shfl_down_16;
+    float _shfl_down_17 = __shfl_down_sync(0xFFFFFFFF, acc_2, 4, 32);
+    acc_2 = acc_2 + _shfl_down_17;
+    float _shfl_down_18 = __shfl_down_sync(0xFFFFFFFF, acc_2, 2, 32);
+    acc_2 = acc_2 + _shfl_down_18;
+    float _shfl_down_19 = __shfl_down_sync(0xFFFFFFFF, acc_2, 1, 32);
+    acc_2 = acc_2 + _shfl_down_19;
+    s_row0 = acc_2;
+    float acc_3 = s_row511;
+    float _shfl_down_20 = __shfl_down_sync(0xFFFFFFFF, acc_3, 16, 32);
+    acc_3 = acc_3 + _shfl_down_20;
+    float _shfl_down_21 = __shfl_down_sync(0xFFFFFFFF, acc_3, 8, 32);
+    acc_3 = acc_3 + _shfl_down_21;
+    float _shfl_down_22 = __shfl_down_sync(0xFFFFFFFF, acc_3, 4, 32);
+    acc_3 = acc_3 + _shfl_down_22;
+    float _shfl_down_23 = __shfl_down_sync(0xFFFFFFFF, acc_3, 2, 32);
+    acc_3 = acc_3 + _shfl_down_23;
+    float _shfl_down_24 = __shfl_down_sync(0xFFFFFFFF, acc_3, 1, 32);
+    acc_3 = acc_3 + _shfl_down_24;
+    s_row511 = acc_3;
+    if (lane == 0) {
+        scratch[warp * 5] = s_col0;
+        scratch[warp * 5 + 1] = s_col383;
+        scratch[warp * 5 + 2] = s_col511;
+        scratch[warp * 5 + 3] = s_row0;
+        scratch[warp * 5 + 4] = s_row511;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float t_col0 = 0.0f;
+        float t_col383 = 0.0f;
+        float t_col511 = 0.0f;
+        float t_row0 = 0.0f;
+        float t_row511 = 0.0f;
+        if (lane < 8) {
+            t_col0 = scratch[lane * 5];
+            t_col383 = scratch[lane * 5 + 1];
+            t_col511 = scratch[lane * 5 + 2];
+            t_row0 = scratch[lane * 5 + 3];
+            t_row511 = scratch[lane * 5 + 4];
+        }
+        float acc_4 = t_col0;
+        float _shfl_down_25 = __shfl_down_sync(0xFFFFFFFF, acc_4, 16, 32);
+        acc_4 = acc_4 + _shfl_down_25;
+        float _shfl_down_26 = __shfl_down_sync(0xFFFFFFFF, acc_4, 8, 32);
+        acc_4 = acc_4 + _shfl_down_26;
+        float _shfl_down_27 = __shfl_down_sync(0xFFFFFFFF, acc_4, 4, 32);
+        acc_4 = acc_4 + _shfl_down_27;
+        float _shfl_down_28 = __shfl_down_sync(0xFFFFFFFF, acc_4, 2, 32);
+        acc_4 = acc_4 + _shfl_down_28;
+        float _shfl_down_29 = __shfl_down_sync(0xFFFFFFFF, acc_4, 1, 32);
+        acc_4 = acc_4 + _shfl_down_29;
+        t_col0 = acc_4;
+        float acc_5 = t_col383;
+        float _shfl_down_30 = __shfl_down_sync(0xFFFFFFFF, acc_5, 16, 32);
+        acc_5 = acc_5 + _shfl_down_30;
+        float _shfl_down_31 = __shfl_down_sync(0xFFFFFFFF, acc_5, 8, 32);
+        acc_5 = acc_5 + _shfl_down_31;
+        float _shfl_down_32 = __shfl_down_sync(0xFFFFFFFF, acc_5, 4, 32);
+        acc_5 = acc_5 + _shfl_down_32;
+        float _shfl_down_33 = __shfl_down_sync(0xFFFFFFFF, acc_5, 2, 32);
+        acc_5 = acc_5 + _shfl_down_33;
+        float _shfl_down_34 = __shfl_down_sync(0xFFFFFFFF, acc_5, 1, 32);
+        acc_5 = acc_5 + _shfl_down_34;
+        t_col383 = acc_5;
+        float acc_6 = t_col511;
+        float _shfl_down_35 = __shfl_down_sync(0xFFFFFFFF, acc_6, 16, 32);
+        acc_6 = acc_6 + _shfl_down_35;
+        float _shfl_down_36 = __shfl_down_sync(0xFFFFFFFF, acc_6, 8, 32);
+        acc_6 = acc_6 + _shfl_down_36;
+        float _shfl_down_37 = __shfl_down_sync(0xFFFFFFFF, acc_6, 4, 32);
+        acc_6 = acc_6 + _shfl_down_37;
+        float _shfl_down_38 = __shfl_down_sync(0xFFFFFFFF, acc_6, 2, 32);
+        acc_6 = acc_6 + _shfl_down_38;
+        float _shfl_down_39 = __shfl_down_sync(0xFFFFFFFF, acc_6, 1, 32);
+        acc_6 = acc_6 + _shfl_down_39;
+        t_col511 = acc_6;
+        float acc_7 = t_row0;
+        float _shfl_down_40 = __shfl_down_sync(0xFFFFFFFF, acc_7, 16, 32);
+        acc_7 = acc_7 + _shfl_down_40;
+        float _shfl_down_41 = __shfl_down_sync(0xFFFFFFFF, acc_7, 8, 32);
+        acc_7 = acc_7 + _shfl_down_41;
+        float _shfl_down_42 = __shfl_down_sync(0xFFFFFFFF, acc_7, 4, 32);
+        acc_7 = acc_7 + _shfl_down_42;
+        float _shfl_down_43 = __shfl_down_sync(0xFFFFFFFF, acc_7, 2, 32);
+        acc_7 = acc_7 + _shfl_down_43;
+        float _shfl_down_44 = __shfl_down_sync(0xFFFFFFFF, acc_7, 1, 32);
+        acc_7 = acc_7 + _shfl_down_44;
+        t_row0 = acc_7;
+        float acc_8 = t_row511;
+        float _shfl_down_45 = __shfl_down_sync(0xFFFFFFFF, acc_8, 16, 32);
+        acc_8 = acc_8 + _shfl_down_45;
+        float _shfl_down_46 = __shfl_down_sync(0xFFFFFFFF, acc_8, 8, 32);
+        acc_8 = acc_8 + _shfl_down_46;
+        float _shfl_down_47 = __shfl_down_sync(0xFFFFFFFF, acc_8, 4, 32);
+        acc_8 = acc_8 + _shfl_down_47;
+        float _shfl_down_48 = __shfl_down_sync(0xFFFFFFFF, acc_8, 2, 32);
+        acc_8 = acc_8 + _shfl_down_48;
+        float _shfl_down_49 = __shfl_down_sync(0xFFFFFFFF, acc_8, 1, 32);
+        acc_8 = acc_8 + _shfl_down_49;
+        t_row511 = acc_8;
+        if (lane == 0) {
+            float col0_mean = t_col0 / 512.0f;
+            float col383_mean = t_col383 / 512.0f;
+            float col511_mean = t_col511 / 512.0f;
+            float row0_mean = t_row0 / 512.0f;
+            float row511_mean = t_row511 / 512.0f;
+            float denom = col0_mean;
+            if (denom < 1e-30f) {
+                denom = 1e-30f;
+            }
+            float scale_ratio_383 = col383_mean / denom;
+            float scale_ratio_511 = col511_mean / denom;
+            float diag384 = data[matrix_base + 384 * n + 384];
+            float far_band_probe = data[matrix_base + 100 * n + 300];
+            int safe = 0;
+            if (scale_ratio_511 >= 0.003f & scale_ratio_511 <= 0.03f) {
+                safe = 1;
+            }
+            if (diag384 == 0.0f & scale_ratio_383 >= 0.01f & scale_ratio_383 <= 0.1f) {
+                safe = 1;
+            }
+            if (far_band_probe == 0.0f) {
+                safe = 0;
+            }
+            if (row511_mean < row0_mean * 0.001f) {
+                safe = 0;
+            }
+            int clustered = 0;
+            if (scale_ratio_511 < 1e-05f & scale_ratio_383 < 1e-05f) {
+                clustered = 1;
+            }
+            if (diag384 == 0.0f) {
+                clustered = 0;
+            }
+            if (far_band_probe == 0.0f) {
+                clustered = 0;
+            }
+            if (row511_mean < row0_mean * 0.001f) {
+                clustered = 0;
+            }
+            int route = 0;
+            if (clustered != 0) {
+                route = 2;
+            }
+            if (safe != 0) {
+                route = 1;
+            }
+            mask_out[batch_id] = route;
+        }
+    }
 }
 } // extern "C"
 '''
@@ -443,10 +443,10 @@ typedef signed int         int32_t;
 typedef short int          int16_t;
 #include <cuda_bf16.h>
 __device__ __forceinline__ int make_warp_uniform(int x) {
-int result;
-asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-: "=r"(result) : "r"(x));
-return result;
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
 }
 #define NUM_MAIN_STAGES 1
 #define SMEM_SCRATCH_OFF 0
@@ -457,338 +457,338 @@ return result;
 #define n 1024
 #define fields 8
 __device__ __forceinline__ float max_noftz(float a, float b) {
-float c;
-asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-return c;
+    float c;
+    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+    return c;
 }
 extern "C" {
 __global__ __launch_bounds__(256) void
 kernel_batched_qr_geqrf_n1024_qr2_sample_route(float* __restrict__ data, int32_t* __restrict__ route_out)
 {
-const int tid = threadIdx.x;
-const int warp = make_warp_uniform(tid / 32);
-const int lane = tid % 32;
-extern __shared__ __align__(1024) char smem_raw[];
-int smem;
-smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-const int smem_scratch = smem + 0;
-const int bid = blockIdx.x;
-const int num_bids = gridDim.x;
-const int warp_id = warp;
-const int lane_id = lane;
-float* scratch = (float*)(smem_raw + 0);
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    const int smem_scratch = smem + 0;
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const int warp_id = warp;
+    const int lane_id = lane;
+    float* scratch = (float*)(smem_raw + 0);
 #define scratch_addr (smem + 0)
-// === Task calls (dependency order) ===
-int batch_id = bid;
-int matrix_base = batch_id * n * n;
-float m_col01 = 0.0f;
-float m_repeated = 0.0f;
-float s_col0_abs = 0.0f;
-float s_col1023_abs = 0.0f;
-float s_col0_sq = 0.0f;
-float s_col768_col0 = 0.0f;
-float m_col768_abs = 0.0f;
-float col0_keep[4];
-float col768_keep[4];
+    // === Task calls (dependency order) ===
+    int batch_id = bid;
+    int matrix_base = batch_id * n * n;
+    float m_col01 = 0.0f;
+    float m_repeated = 0.0f;
+    float s_col0_abs = 0.0f;
+    float s_col1023_abs = 0.0f;
+    float s_col0_sq = 0.0f;
+    float s_col768_col0 = 0.0f;
+    float m_col768_abs = 0.0f;
+    float col0_keep[4];
+    float col768_keep[4];
 #pragma unroll
-for (int keep_init = 0; keep_init < 4; keep_init++) {
-col0_keep[keep_init] = 0.0f;
-col768_keep[keep_init] = 0.0f;
-}
+    for (int keep_init = 0; keep_init < 4; keep_init++) {
+        col0_keep[keep_init] = 0.0f;
+        col768_keep[keep_init] = 0.0f;
+    }
 #pragma unroll
-for (int offset_base = 0; offset_base < n; offset_base += 256) {
-const int keep_slot = offset_base / 256;
-int row = offset_base + tid;
-float col0 = data[matrix_base + row * n];
-float col1 = data[matrix_base + row * n + 1];
-float col768 = data[matrix_base + row * n + 768];
-float col1023 = data[matrix_base + row * n + 1023];
-col0_keep[keep_slot] = col0;
-col768_keep[keep_slot] = col768;
-float abs_col0 = col0;
-if (abs_col0 < 0.0f) {
-abs_col0 = 0.0f - abs_col0;
-}
-float abs_col1023 = col1023;
-if (abs_col1023 < 0.0f) {
-abs_col1023 = 0.0f - abs_col1023;
-}
-float abs_col768 = col768;
-if (abs_col768 < 0.0f) {
-abs_col768 = 0.0f - abs_col768;
-}
-float diff01 = col0 - col1;
-if (diff01 < 0.0f) {
-diff01 = 0.0f - diff01;
-}
-float diff_repeated = col0 - col768;
-if (diff_repeated < 0.0f) {
-diff_repeated = 0.0f - diff_repeated;
-}
-if (diff01 > m_col01) {
-m_col01 = diff01;
-}
-if (diff_repeated > m_repeated) {
-m_repeated = diff_repeated;
-}
-if (abs_col768 > m_col768_abs) {
-m_col768_abs = abs_col768;
-}
-s_col0_abs = s_col0_abs + abs_col0;
-s_col1023_abs = s_col1023_abs + abs_col1023;
-s_col0_sq = s_col0_sq + col0 * col0;
-s_col768_col0 = s_col768_col0 + col768 * col0;
-}
+    for (int offset_base = 0; offset_base < n; offset_base += 256) {
+        const int keep_slot = offset_base / 256;
+        int row = offset_base + tid;
+        float col0 = data[matrix_base + row * n];
+        float col1 = data[matrix_base + row * n + 1];
+        float col768 = data[matrix_base + row * n + 768];
+        float col1023 = data[matrix_base + row * n + 1023];
+        col0_keep[keep_slot] = col0;
+        col768_keep[keep_slot] = col768;
+        float abs_col0 = col0;
+        if (abs_col0 < 0.0f) {
+            abs_col0 = 0.0f - abs_col0;
+        }
+        float abs_col1023 = col1023;
+        if (abs_col1023 < 0.0f) {
+            abs_col1023 = 0.0f - abs_col1023;
+        }
+        float abs_col768 = col768;
+        if (abs_col768 < 0.0f) {
+            abs_col768 = 0.0f - abs_col768;
+        }
+        float diff01 = col0 - col1;
+        if (diff01 < 0.0f) {
+            diff01 = 0.0f - diff01;
+        }
+        float diff_repeated = col0 - col768;
+        if (diff_repeated < 0.0f) {
+            diff_repeated = 0.0f - diff_repeated;
+        }
+        if (diff01 > m_col01) {
+            m_col01 = diff01;
+        }
+        if (diff_repeated > m_repeated) {
+            m_repeated = diff_repeated;
+        }
+        if (abs_col768 > m_col768_abs) {
+            m_col768_abs = abs_col768;
+        }
+        s_col0_abs = s_col0_abs + abs_col0;
+        s_col1023_abs = s_col1023_abs + abs_col1023;
+        s_col0_sq = s_col0_sq + col0 * col0;
+        s_col768_col0 = s_col768_col0 + col768 * col0;
+    }
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-m_col01 = max_noftz(m_col01, __shfl_xor_sync(0xFFFFFFFF, m_col01, offset));
+    for (int offset = 16; offset > 0; offset >>= 1)
+    m_col01 = max_noftz(m_col01, __shfl_xor_sync(0xFFFFFFFF, m_col01, offset));
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-m_repeated = max_noftz(m_repeated, __shfl_xor_sync(0xFFFFFFFF, m_repeated, offset));
+    for (int offset = 16; offset > 0; offset >>= 1)
+    m_repeated = max_noftz(m_repeated, __shfl_xor_sync(0xFFFFFFFF, m_repeated, offset));
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-m_col768_abs = max_noftz(m_col768_abs, __shfl_xor_sync(0xFFFFFFFF, m_col768_abs, offset));
-float acc = s_col0_abs;
-float _shfl_down_0 = __shfl_down_sync(0xFFFFFFFF, acc, 16, 32);
-acc = acc + _shfl_down_0;
-float _shfl_down_1 = __shfl_down_sync(0xFFFFFFFF, acc, 8, 32);
-acc = acc + _shfl_down_1;
-float _shfl_down_2 = __shfl_down_sync(0xFFFFFFFF, acc, 4, 32);
-acc = acc + _shfl_down_2;
-float _shfl_down_3 = __shfl_down_sync(0xFFFFFFFF, acc, 2, 32);
-acc = acc + _shfl_down_3;
-float _shfl_down_4 = __shfl_down_sync(0xFFFFFFFF, acc, 1, 32);
-acc = acc + _shfl_down_4;
-s_col0_abs = acc;
-float acc_0 = s_col1023_abs;
-float _shfl_down_5 = __shfl_down_sync(0xFFFFFFFF, acc_0, 16, 32);
-acc_0 = acc_0 + _shfl_down_5;
-float _shfl_down_6 = __shfl_down_sync(0xFFFFFFFF, acc_0, 8, 32);
-acc_0 = acc_0 + _shfl_down_6;
-float _shfl_down_7 = __shfl_down_sync(0xFFFFFFFF, acc_0, 4, 32);
-acc_0 = acc_0 + _shfl_down_7;
-float _shfl_down_8 = __shfl_down_sync(0xFFFFFFFF, acc_0, 2, 32);
-acc_0 = acc_0 + _shfl_down_8;
-float _shfl_down_9 = __shfl_down_sync(0xFFFFFFFF, acc_0, 1, 32);
-acc_0 = acc_0 + _shfl_down_9;
-s_col1023_abs = acc_0;
-float acc_1 = s_col0_sq;
-float _shfl_down_10 = __shfl_down_sync(0xFFFFFFFF, acc_1, 16, 32);
-acc_1 = acc_1 + _shfl_down_10;
-float _shfl_down_11 = __shfl_down_sync(0xFFFFFFFF, acc_1, 8, 32);
-acc_1 = acc_1 + _shfl_down_11;
-float _shfl_down_12 = __shfl_down_sync(0xFFFFFFFF, acc_1, 4, 32);
-acc_1 = acc_1 + _shfl_down_12;
-float _shfl_down_13 = __shfl_down_sync(0xFFFFFFFF, acc_1, 2, 32);
-acc_1 = acc_1 + _shfl_down_13;
-float _shfl_down_14 = __shfl_down_sync(0xFFFFFFFF, acc_1, 1, 32);
-acc_1 = acc_1 + _shfl_down_14;
-s_col0_sq = acc_1;
-float acc_2 = s_col768_col0;
-float _shfl_down_15 = __shfl_down_sync(0xFFFFFFFF, acc_2, 16, 32);
-acc_2 = acc_2 + _shfl_down_15;
-float _shfl_down_16 = __shfl_down_sync(0xFFFFFFFF, acc_2, 8, 32);
-acc_2 = acc_2 + _shfl_down_16;
-float _shfl_down_17 = __shfl_down_sync(0xFFFFFFFF, acc_2, 4, 32);
-acc_2 = acc_2 + _shfl_down_17;
-float _shfl_down_18 = __shfl_down_sync(0xFFFFFFFF, acc_2, 2, 32);
-acc_2 = acc_2 + _shfl_down_18;
-float _shfl_down_19 = __shfl_down_sync(0xFFFFFFFF, acc_2, 1, 32);
-acc_2 = acc_2 + _shfl_down_19;
-s_col768_col0 = acc_2;
-if (lane == 0) {
-int base = warp * fields;
-scratch[base] = m_col01;
-scratch[base + 1] = m_repeated;
-scratch[base + 2] = s_col0_abs;
-scratch[base + 3] = s_col1023_abs;
-scratch[base + 4] = s_col0_sq;
-scratch[base + 5] = s_col768_col0;
-scratch[base + 6] = m_col768_abs;
-}
-__syncthreads();
-if (warp == 0) {
-float t_col01 = 0.0f;
-float t_repeated = 0.0f;
-float t_col0_abs = 0.0f;
-float t_col1023_abs = 0.0f;
-float t_col0_sq = 0.0f;
-float t_col768_col0 = 0.0f;
-float t_col768_abs = 0.0f;
-if (lane < 8) {
-int read_base = lane * fields;
-t_col01 = scratch[read_base];
-t_repeated = scratch[read_base + 1];
-t_col0_abs = scratch[read_base + 2];
-t_col1023_abs = scratch[read_base + 3];
-t_col0_sq = scratch[read_base + 4];
-t_col768_col0 = scratch[read_base + 5];
-t_col768_abs = scratch[read_base + 6];
-}
+    for (int offset = 16; offset > 0; offset >>= 1)
+    m_col768_abs = max_noftz(m_col768_abs, __shfl_xor_sync(0xFFFFFFFF, m_col768_abs, offset));
+    float acc = s_col0_abs;
+    float _shfl_down_0 = __shfl_down_sync(0xFFFFFFFF, acc, 16, 32);
+    acc = acc + _shfl_down_0;
+    float _shfl_down_1 = __shfl_down_sync(0xFFFFFFFF, acc, 8, 32);
+    acc = acc + _shfl_down_1;
+    float _shfl_down_2 = __shfl_down_sync(0xFFFFFFFF, acc, 4, 32);
+    acc = acc + _shfl_down_2;
+    float _shfl_down_3 = __shfl_down_sync(0xFFFFFFFF, acc, 2, 32);
+    acc = acc + _shfl_down_3;
+    float _shfl_down_4 = __shfl_down_sync(0xFFFFFFFF, acc, 1, 32);
+    acc = acc + _shfl_down_4;
+    s_col0_abs = acc;
+    float acc_0 = s_col1023_abs;
+    float _shfl_down_5 = __shfl_down_sync(0xFFFFFFFF, acc_0, 16, 32);
+    acc_0 = acc_0 + _shfl_down_5;
+    float _shfl_down_6 = __shfl_down_sync(0xFFFFFFFF, acc_0, 8, 32);
+    acc_0 = acc_0 + _shfl_down_6;
+    float _shfl_down_7 = __shfl_down_sync(0xFFFFFFFF, acc_0, 4, 32);
+    acc_0 = acc_0 + _shfl_down_7;
+    float _shfl_down_8 = __shfl_down_sync(0xFFFFFFFF, acc_0, 2, 32);
+    acc_0 = acc_0 + _shfl_down_8;
+    float _shfl_down_9 = __shfl_down_sync(0xFFFFFFFF, acc_0, 1, 32);
+    acc_0 = acc_0 + _shfl_down_9;
+    s_col1023_abs = acc_0;
+    float acc_1 = s_col0_sq;
+    float _shfl_down_10 = __shfl_down_sync(0xFFFFFFFF, acc_1, 16, 32);
+    acc_1 = acc_1 + _shfl_down_10;
+    float _shfl_down_11 = __shfl_down_sync(0xFFFFFFFF, acc_1, 8, 32);
+    acc_1 = acc_1 + _shfl_down_11;
+    float _shfl_down_12 = __shfl_down_sync(0xFFFFFFFF, acc_1, 4, 32);
+    acc_1 = acc_1 + _shfl_down_12;
+    float _shfl_down_13 = __shfl_down_sync(0xFFFFFFFF, acc_1, 2, 32);
+    acc_1 = acc_1 + _shfl_down_13;
+    float _shfl_down_14 = __shfl_down_sync(0xFFFFFFFF, acc_1, 1, 32);
+    acc_1 = acc_1 + _shfl_down_14;
+    s_col0_sq = acc_1;
+    float acc_2 = s_col768_col0;
+    float _shfl_down_15 = __shfl_down_sync(0xFFFFFFFF, acc_2, 16, 32);
+    acc_2 = acc_2 + _shfl_down_15;
+    float _shfl_down_16 = __shfl_down_sync(0xFFFFFFFF, acc_2, 8, 32);
+    acc_2 = acc_2 + _shfl_down_16;
+    float _shfl_down_17 = __shfl_down_sync(0xFFFFFFFF, acc_2, 4, 32);
+    acc_2 = acc_2 + _shfl_down_17;
+    float _shfl_down_18 = __shfl_down_sync(0xFFFFFFFF, acc_2, 2, 32);
+    acc_2 = acc_2 + _shfl_down_18;
+    float _shfl_down_19 = __shfl_down_sync(0xFFFFFFFF, acc_2, 1, 32);
+    acc_2 = acc_2 + _shfl_down_19;
+    s_col768_col0 = acc_2;
+    if (lane == 0) {
+        int base = warp * fields;
+        scratch[base] = m_col01;
+        scratch[base + 1] = m_repeated;
+        scratch[base + 2] = s_col0_abs;
+        scratch[base + 3] = s_col1023_abs;
+        scratch[base + 4] = s_col0_sq;
+        scratch[base + 5] = s_col768_col0;
+        scratch[base + 6] = m_col768_abs;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float t_col01 = 0.0f;
+        float t_repeated = 0.0f;
+        float t_col0_abs = 0.0f;
+        float t_col1023_abs = 0.0f;
+        float t_col0_sq = 0.0f;
+        float t_col768_col0 = 0.0f;
+        float t_col768_abs = 0.0f;
+        if (lane < 8) {
+            int read_base = lane * fields;
+            t_col01 = scratch[read_base];
+            t_repeated = scratch[read_base + 1];
+            t_col0_abs = scratch[read_base + 2];
+            t_col1023_abs = scratch[read_base + 3];
+            t_col0_sq = scratch[read_base + 4];
+            t_col768_col0 = scratch[read_base + 5];
+            t_col768_abs = scratch[read_base + 6];
+        }
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-t_col01 = max_noftz(t_col01, __shfl_xor_sync(0xFFFFFFFF, t_col01, offset));
+        for (int offset = 16; offset > 0; offset >>= 1)
+        t_col01 = max_noftz(t_col01, __shfl_xor_sync(0xFFFFFFFF, t_col01, offset));
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-t_repeated = max_noftz(t_repeated, __shfl_xor_sync(0xFFFFFFFF, t_repeated, offset));
+        for (int offset = 16; offset > 0; offset >>= 1)
+        t_repeated = max_noftz(t_repeated, __shfl_xor_sync(0xFFFFFFFF, t_repeated, offset));
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-t_col768_abs = max_noftz(t_col768_abs, __shfl_xor_sync(0xFFFFFFFF, t_col768_abs, offset));
-float acc_3 = t_col0_abs;
-float _shfl_down_20 = __shfl_down_sync(0xFFFFFFFF, acc_3, 16, 32);
-acc_3 = acc_3 + _shfl_down_20;
-float _shfl_down_21 = __shfl_down_sync(0xFFFFFFFF, acc_3, 8, 32);
-acc_3 = acc_3 + _shfl_down_21;
-float _shfl_down_22 = __shfl_down_sync(0xFFFFFFFF, acc_3, 4, 32);
-acc_3 = acc_3 + _shfl_down_22;
-float _shfl_down_23 = __shfl_down_sync(0xFFFFFFFF, acc_3, 2, 32);
-acc_3 = acc_3 + _shfl_down_23;
-float _shfl_down_24 = __shfl_down_sync(0xFFFFFFFF, acc_3, 1, 32);
-acc_3 = acc_3 + _shfl_down_24;
-t_col0_abs = acc_3;
-float acc_4 = t_col1023_abs;
-float _shfl_down_25 = __shfl_down_sync(0xFFFFFFFF, acc_4, 16, 32);
-acc_4 = acc_4 + _shfl_down_25;
-float _shfl_down_26 = __shfl_down_sync(0xFFFFFFFF, acc_4, 8, 32);
-acc_4 = acc_4 + _shfl_down_26;
-float _shfl_down_27 = __shfl_down_sync(0xFFFFFFFF, acc_4, 4, 32);
-acc_4 = acc_4 + _shfl_down_27;
-float _shfl_down_28 = __shfl_down_sync(0xFFFFFFFF, acc_4, 2, 32);
-acc_4 = acc_4 + _shfl_down_28;
-float _shfl_down_29 = __shfl_down_sync(0xFFFFFFFF, acc_4, 1, 32);
-acc_4 = acc_4 + _shfl_down_29;
-t_col1023_abs = acc_4;
-float acc_5 = t_col0_sq;
-float _shfl_down_30 = __shfl_down_sync(0xFFFFFFFF, acc_5, 16, 32);
-acc_5 = acc_5 + _shfl_down_30;
-float _shfl_down_31 = __shfl_down_sync(0xFFFFFFFF, acc_5, 8, 32);
-acc_5 = acc_5 + _shfl_down_31;
-float _shfl_down_32 = __shfl_down_sync(0xFFFFFFFF, acc_5, 4, 32);
-acc_5 = acc_5 + _shfl_down_32;
-float _shfl_down_33 = __shfl_down_sync(0xFFFFFFFF, acc_5, 2, 32);
-acc_5 = acc_5 + _shfl_down_33;
-float _shfl_down_34 = __shfl_down_sync(0xFFFFFFFF, acc_5, 1, 32);
-acc_5 = acc_5 + _shfl_down_34;
-t_col0_sq = acc_5;
-float acc_6 = t_col768_col0;
-float _shfl_down_35 = __shfl_down_sync(0xFFFFFFFF, acc_6, 16, 32);
-acc_6 = acc_6 + _shfl_down_35;
-float _shfl_down_36 = __shfl_down_sync(0xFFFFFFFF, acc_6, 8, 32);
-acc_6 = acc_6 + _shfl_down_36;
-float _shfl_down_37 = __shfl_down_sync(0xFFFFFFFF, acc_6, 4, 32);
-acc_6 = acc_6 + _shfl_down_37;
-float _shfl_down_38 = __shfl_down_sync(0xFFFFFFFF, acc_6, 2, 32);
-acc_6 = acc_6 + _shfl_down_38;
-float _shfl_down_39 = __shfl_down_sync(0xFFFFFFFF, acc_6, 1, 32);
-acc_6 = acc_6 + _shfl_down_39;
-t_col768_col0 = acc_6;
-if (lane == 0) {
-float denom_fit = t_col0_sq;
-if (denom_fit < 1e-30f) {
-denom_fit = 1e-30f;
-}
-scratch[0] = t_col01;
-scratch[1] = t_repeated;
-scratch[2] = t_col0_abs;
-scratch[3] = t_col1023_abs;
-scratch[4] = t_col0_sq;
-scratch[5] = t_col768_col0 / denom_fit;
-scratch[6] = t_col768_abs;
-}
-}
-__syncthreads();
-float fit = scratch[5];
-float m_repeat_resid = 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+        t_col768_abs = max_noftz(t_col768_abs, __shfl_xor_sync(0xFFFFFFFF, t_col768_abs, offset));
+        float acc_3 = t_col0_abs;
+        float _shfl_down_20 = __shfl_down_sync(0xFFFFFFFF, acc_3, 16, 32);
+        acc_3 = acc_3 + _shfl_down_20;
+        float _shfl_down_21 = __shfl_down_sync(0xFFFFFFFF, acc_3, 8, 32);
+        acc_3 = acc_3 + _shfl_down_21;
+        float _shfl_down_22 = __shfl_down_sync(0xFFFFFFFF, acc_3, 4, 32);
+        acc_3 = acc_3 + _shfl_down_22;
+        float _shfl_down_23 = __shfl_down_sync(0xFFFFFFFF, acc_3, 2, 32);
+        acc_3 = acc_3 + _shfl_down_23;
+        float _shfl_down_24 = __shfl_down_sync(0xFFFFFFFF, acc_3, 1, 32);
+        acc_3 = acc_3 + _shfl_down_24;
+        t_col0_abs = acc_3;
+        float acc_4 = t_col1023_abs;
+        float _shfl_down_25 = __shfl_down_sync(0xFFFFFFFF, acc_4, 16, 32);
+        acc_4 = acc_4 + _shfl_down_25;
+        float _shfl_down_26 = __shfl_down_sync(0xFFFFFFFF, acc_4, 8, 32);
+        acc_4 = acc_4 + _shfl_down_26;
+        float _shfl_down_27 = __shfl_down_sync(0xFFFFFFFF, acc_4, 4, 32);
+        acc_4 = acc_4 + _shfl_down_27;
+        float _shfl_down_28 = __shfl_down_sync(0xFFFFFFFF, acc_4, 2, 32);
+        acc_4 = acc_4 + _shfl_down_28;
+        float _shfl_down_29 = __shfl_down_sync(0xFFFFFFFF, acc_4, 1, 32);
+        acc_4 = acc_4 + _shfl_down_29;
+        t_col1023_abs = acc_4;
+        float acc_5 = t_col0_sq;
+        float _shfl_down_30 = __shfl_down_sync(0xFFFFFFFF, acc_5, 16, 32);
+        acc_5 = acc_5 + _shfl_down_30;
+        float _shfl_down_31 = __shfl_down_sync(0xFFFFFFFF, acc_5, 8, 32);
+        acc_5 = acc_5 + _shfl_down_31;
+        float _shfl_down_32 = __shfl_down_sync(0xFFFFFFFF, acc_5, 4, 32);
+        acc_5 = acc_5 + _shfl_down_32;
+        float _shfl_down_33 = __shfl_down_sync(0xFFFFFFFF, acc_5, 2, 32);
+        acc_5 = acc_5 + _shfl_down_33;
+        float _shfl_down_34 = __shfl_down_sync(0xFFFFFFFF, acc_5, 1, 32);
+        acc_5 = acc_5 + _shfl_down_34;
+        t_col0_sq = acc_5;
+        float acc_6 = t_col768_col0;
+        float _shfl_down_35 = __shfl_down_sync(0xFFFFFFFF, acc_6, 16, 32);
+        acc_6 = acc_6 + _shfl_down_35;
+        float _shfl_down_36 = __shfl_down_sync(0xFFFFFFFF, acc_6, 8, 32);
+        acc_6 = acc_6 + _shfl_down_36;
+        float _shfl_down_37 = __shfl_down_sync(0xFFFFFFFF, acc_6, 4, 32);
+        acc_6 = acc_6 + _shfl_down_37;
+        float _shfl_down_38 = __shfl_down_sync(0xFFFFFFFF, acc_6, 2, 32);
+        acc_6 = acc_6 + _shfl_down_38;
+        float _shfl_down_39 = __shfl_down_sync(0xFFFFFFFF, acc_6, 1, 32);
+        acc_6 = acc_6 + _shfl_down_39;
+        t_col768_col0 = acc_6;
+        if (lane == 0) {
+            float denom_fit = t_col0_sq;
+            if (denom_fit < 1e-30f) {
+                denom_fit = 1e-30f;
+            }
+            scratch[0] = t_col01;
+            scratch[1] = t_repeated;
+            scratch[2] = t_col0_abs;
+            scratch[3] = t_col1023_abs;
+            scratch[4] = t_col0_sq;
+            scratch[5] = t_col768_col0 / denom_fit;
+            scratch[6] = t_col768_abs;
+        }
+    }
+    __syncthreads();
+    float fit = scratch[5];
+    float m_repeat_resid = 0.0f;
 #pragma unroll
-for (int keep_i = 0; keep_i < 4; keep_i++) {
-float col0_b = col0_keep[keep_i];
-float col768_b = col768_keep[keep_i];
-float resid = col768_b - fit * col0_b;
-if (resid < 0.0f) {
-resid = 0.0f - resid;
-}
-if (resid > m_repeat_resid) {
-m_repeat_resid = resid;
-}
-}
+    for (int keep_i = 0; keep_i < 4; keep_i++) {
+        float col0_b = col0_keep[keep_i];
+        float col768_b = col768_keep[keep_i];
+        float resid = col768_b - fit * col0_b;
+        if (resid < 0.0f) {
+            resid = 0.0f - resid;
+        }
+        if (resid > m_repeat_resid) {
+            m_repeat_resid = resid;
+        }
+    }
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-m_repeat_resid = max_noftz(m_repeat_resid, __shfl_xor_sync(0xFFFFFFFF, m_repeat_resid, offset));
-if (lane == 0) {
-scratch[fields + warp] = m_repeat_resid;
-}
-__syncthreads();
-if (warp == 0) {
-float t_resid = 0.0f;
-if (lane < 8) {
-t_resid = scratch[fields + lane];
-}
+    for (int offset = 16; offset > 0; offset >>= 1)
+    m_repeat_resid = max_noftz(m_repeat_resid, __shfl_xor_sync(0xFFFFFFFF, m_repeat_resid, offset));
+    if (lane == 0) {
+        scratch[fields + warp] = m_repeat_resid;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float t_resid = 0.0f;
+        if (lane < 8) {
+            t_resid = scratch[fields + lane];
+        }
 #pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-t_resid = max_noftz(t_resid, __shfl_xor_sync(0xFFFFFFFF, t_resid, offset));
-if (lane == 0) {
-float col01_maxdiff = scratch[0];
-float repeated_tail_maxdiff = scratch[1];
-float col0_abs_sum = scratch[2];
-float col1023_abs_sum = scratch[3];
-float col0_mean = col0_abs_sum / 1024.0f;
-float col1023_mean = col1023_abs_sum / 1024.0f;
-float col768_absmax = scratch[6];
-float denom_scale = col0_mean;
-if (denom_scale < 1e-30f) {
-denom_scale = 1e-30f;
-}
-float scale_ratio = col1023_mean / denom_scale;
-float denom_resid = col768_absmax;
-if (denom_resid < 1e-30f) {
-denom_resid = 1e-30f;
-}
-float repeat_residual = t_resid / denom_resid;
-float far_band_probe = data[matrix_base + 100 * n + 600];
-int far_ok = 0;
-if (far_band_probe != 0.0f) {
-far_ok = 1;
-}
-int scaled = 0;
-if (scale_ratio >= 1e-05f & scale_ratio <= 0.03f) {
-scaled = 1;
-}
-int dense = 0;
-if (scaled != 0 & far_ok != 0) {
-dense = 1;
-}
-if (col01_maxdiff < 0.1f) {
-dense = 0;
-}
-if (repeat_residual < 0.05f) {
-dense = 0;
-}
-int repeated_tail = 0;
-if (repeated_tail_maxdiff < 0.001f & far_ok != 0) {
-repeated_tail = 1;
-}
-int route = 0;
-if (dense != 0) {
-route = 1;
-}
-if (repeated_tail != 0) {
-route = 3;
-}
-if (route == 0 & scaled != 0) {
-route = 4;
-}
-if (route == 1 & scale_ratio <= 0.012f) {
-route = 6;
-}
-// Homogeneous near-collinear inputs can otherwise look like either a repeated
-// tail (unscaled) or a smoothly scaled dense matrix.  Reserve a distinct code
-// so the batch-level dispatcher sends an all-near-collinear batch to stable QR.
-if (col01_maxdiff < 0.5f * col0_mean) {
-route = 5;
-}
-route_out[batch_id] = route;
-}
-}
+        for (int offset = 16; offset > 0; offset >>= 1)
+        t_resid = max_noftz(t_resid, __shfl_xor_sync(0xFFFFFFFF, t_resid, offset));
+        if (lane == 0) {
+            float col01_maxdiff = scratch[0];
+            float repeated_tail_maxdiff = scratch[1];
+            float col0_abs_sum = scratch[2];
+            float col1023_abs_sum = scratch[3];
+            float col0_mean = col0_abs_sum / 1024.0f;
+            float col1023_mean = col1023_abs_sum / 1024.0f;
+            float col768_absmax = scratch[6];
+            float denom_scale = col0_mean;
+            if (denom_scale < 1e-30f) {
+                denom_scale = 1e-30f;
+            }
+            float scale_ratio = col1023_mean / denom_scale;
+            float denom_resid = col768_absmax;
+            if (denom_resid < 1e-30f) {
+                denom_resid = 1e-30f;
+            }
+            float repeat_residual = t_resid / denom_resid;
+            float far_band_probe = data[matrix_base + 100 * n + 600];
+            int far_ok = 0;
+            if (far_band_probe != 0.0f) {
+                far_ok = 1;
+            }
+            int scaled = 0;
+            if (scale_ratio >= 1e-05f & scale_ratio <= 0.03f) {
+                scaled = 1;
+            }
+            int dense = 0;
+            if (scaled != 0 & far_ok != 0) {
+                dense = 1;
+            }
+            if (col01_maxdiff < 0.1f) {
+                dense = 0;
+            }
+            if (repeat_residual < 0.05f) {
+                dense = 0;
+            }
+            int repeated_tail = 0;
+            if (repeated_tail_maxdiff < 0.001f & far_ok != 0) {
+                repeated_tail = 1;
+            }
+            int route = 0;
+            if (dense != 0) {
+                route = 1;
+            }
+            if (repeated_tail != 0) {
+                route = 3;
+            }
+            if (route == 0 & scaled != 0) {
+                route = 4;
+            }
+            if (route == 1 & scale_ratio <= 0.012f) {
+                route = 6;
+            }
+            // Homogeneous near-collinear inputs can otherwise look like either a repeated
+            // tail (unscaled) or a smoothly scaled dense matrix.  Reserve a distinct code
+            // so the batch-level dispatcher sends an all-near-collinear batch to stable QR.
+            if (col01_maxdiff < 0.5f * col0_mean) {
+                route = 5;
+            }
+            route_out[batch_id] = route;
+        }
+    }
 }
 } // extern "C"
 '''
