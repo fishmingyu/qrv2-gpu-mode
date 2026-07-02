@@ -1,78 +1,113 @@
-# QR2 Recursive Householder Mega-Panels
+# QR2 Recursive Householder Panel Megakernels
 
-A high-performance batched FP32 QR implementation for NVIDIA GPUs. It returns
-the compact `(H, tau)` representation used by `torch.geqrf`.
+A shape-specialized batched FP32 QR implementation for NVIDIA Blackwell GPUs.
+It returns the LAPACK/PyTorch compact Householder representation `(H, tau)`
+used by `torch.geqrf`.
 
-## Attribution
+## Provenance
 
-This implementation uses and adapts the wide-panel Householder CUDA kernels
-from **gau.nernst's QR2 submission** on the
+The wide-panel Householder leaf kernels use and adapt the CUDA design from
+**gau.nernst's QR2 submission** on the
 [GPU MODE leaderboard](https://www.gpumode.com/leaderboard/774?tab=rankings).
-Those kernels are the foundation of the leaf panel factorization. We preserve
-that provenance explicitly instead of encoding the original author's name in
-every internal symbol.
+That provenance is recorded once here and at the top of `submission.py`;
+internal symbols use project-local names.
 
-The main extensions developed in this repository are:
+This repository adds and evaluates:
 
-- recursive Householder composition above the wide-panel leaf kernels;
-- direct construction of parent compact-WY factors for large panels;
-- graph-orchestrated execution of the recursive factorization;
-- per-matrix routing for heterogeneous, ill-conditioned batches;
-- a guarded communication-avoiding QR path for the `4096 x 4096` case;
-- FP32 compact-factor output and robustness against the QR2 numerical gates.
+- recursive Householder panel decomposition above those leaf kernels;
+- terminal-tail specializations, including the n512 active `96 + 96` tail;
+- compact-WY construction and Tensor-Core near/far updates;
+- per-matrix handling of heterogeneous n512 batches;
+- graph replay to amortize a dependent multi-kernel launch schedule;
+- a guarded Gram/CholeskyQR-style path for the benchmark's n4096 profile;
+- FP32 compact-factor reconstruction and the QR2 conditioning checks.
 
-This is therefore a derivative and extended implementation, not a claim that
-the wide-panel leaf kernels were developed independently from scratch.
+This is a derivative implementation. It does not claim the original
+wide-panel kernel design as independent work.
 
-## What is the algorithm?
+## What “megakernel” means here
 
-The implementation is best described as:
+“Megakernel” describes a deliberate **panel fusion boundary**, not the whole
+QR call. A leaf launch loads a multi-column panel and performs the sequential
+Householder reflector chain, intra-panel updates, `tau` generation, and factor
+writeback inside one CUDA kernel.
 
-> Graph-orchestrated recursive Householder QR with fused mega-panel leaf
-> kernels, plus a guarded CAQR path for the largest benchmark shape.
+A recursive node is broader than one leaf. It is currently composed from leaf
+megakernels, small `T` builders, and Tensor-Core `bmm`/`baddbmm` operations.
+The complete recursive node and the complete factorization are therefore not
+single monolithic CUDA kernels.
 
-It is not a persistent kernel, and the complete QR factorization is not fused
-into one monolithic launch. A leaf kernel is a mega-kernel because one launch
-generates and applies many Householder reflectors for a wide panel. Recursive
-nodes and trailing updates are composed from several kernels and matrix
-multiplications.
+This implementation is also **not persistent**: its CTAs factor fixed panels
+and exit; they do not remain resident and pull work from a long-lived queue.
 
-See [ALGORITHM.md](ALGORITHM.md) for the compact-WY baseline, recursive
-construction, GPU mapping, CAQR path, and the distinction from a persistent
-kernel.
+CUDA Graph replay reduces host/driver launch gaps. It does not fuse kernels,
+remove mathematical dependencies, or by itself prove execution overlap. The
+submission creates no auxiliary execution streams.
 
-## Results
+The concise description is:
 
-On one NVIDIA GB200 with CUDA 13 and PyTorch 2.12, the 12-case QR2 leaderboard
-suite reaches a **0.9913 ms geometric mean**. All cases pass the FP32
-compact-QR factor-residual and orthogonality gates measured against the
-original FP32 input.
+> Recursive Householder QR built from fused panel megakernels, compact-WY
+> composition, and Tensor-Core trailing updates, with a guarded
+> CholeskyQR-style large-matrix specialization.
 
-The optimized benchmark shapes are:
+See [ALGORITHM.md](ALGORITHM.md) for the mathematical and implementation
+boundaries.
 
-- `(20, 32, 32)`
-- `(40, 176, 176)`
-- `(40, 352, 352)`
-- `(640, 512, 512)`
-- `(60, 1024, 1024)`
-- `(8, 2048, 2048)`
-- `(2, 4096, 4096)`
+## Verified result
 
-Other square batched FP32 shapes use `torch.geqrf` as a correctness fallback.
+On one NVIDIA GB200 with CUDA 13 and PyTorch 2.12, two complete runs of the
+current 12-case `leaderboard-current` suite produced **0.948304 ms** and
+**0.9503 ms** geometric means. All 12 cases passed the FP32 compact-factor
+residual and orthogonality gates against the original FP32 inputs. The table
+below records the 0.948304 ms run.
+
+| Case | Mean (ms) |
+|---|---:|
+| `b20 n32 dense` | 0.0143 |
+| `b40 n176 dense` | 0.0755 |
+| `b40 n352 dense` | 0.2446 |
+| `b640 n512 dense` | 2.6213 |
+| `b60 n1024 dense` | 1.7618 |
+| `b8 n2048 dense` | 3.0648 |
+| `b2 n4096 dense` | 5.5608 |
+| `b640 n512 mixed` | 2.8325 |
+| `b60 n1024 mixed` | 1.7601 |
+| `b640 n512 rank-deficient` | 2.2982 |
+| `b640 n512 clustered` | 1.5158 |
+| `b60 n1024 near-rank-deficient` | 1.4675 |
+
+The roughly 0.2% run-to-run movement is measurement variability, with the
+largest change in the very short n176 case. The score is an
+environment-specific measurement, not a portable latency guarantee or a
+guarantee that every run is below 0.950 ms.
+
+## Numerical contract
+
+For CUDA FP32 input `A` with shape `(batch, n, n)`, `custom_kernel` returns:
+
+- `H`: FP32, with `R` in the upper triangle and reflector tails below it;
+- `tau`: FP32 Householder coefficients.
+
+The checker reconstructs `Q = householder_product(H, tau)` and validates the
+factor residual and orthogonality in FP64. Internal FP16 reflector copies are
+an update optimization only; the returned representation remains FP32.
+
+The optimized code is intentionally specialized for the seven public batch
+and matrix shapes in the QR2 suite. Unsupported shapes use `torch.geqrf` as a
+correctness fallback.
 
 ## Repository layout
 
-- `submission.py`: the independent submission file with embedded CUDA source;
-- `ALGORITHM.md`: algorithm derivation, diagrams, and implementation mapping;
-- `benchmark.py`: self-contained 12-case correctness and timing harness;
+- `submission.py`: standalone submission with embedded CUDA source;
+- `ALGORITHM.md`: terminology, derivation, and implementation mapping;
+- `benchmark.py`: self-contained 12-case correctness/timing harness;
 - `reference.py`: input profiles and FP64 residual checker.
 
-There are no generated candidates, tuning scripts, or historical experiments
-in this repository.
+There are no generated candidates or historical tuning experiments here.
 
 ## Run
 
-Use a CUDA development image with CUDA 13, then install the dependencies in
+Use a CUDA 13 development image, then install the dependencies from
 `pyproject.toml`.
 
 ```bash
@@ -81,5 +116,5 @@ python benchmark.py --mode benchmark --max-repeats 10
 python benchmark.py --mode leaderboard --json-out .build/leaderboard.json
 ```
 
-`leaderboard` uses up to 1000 repeats and enables correctness rechecks during
-timing. The shorter `benchmark` command is intended for local iteration.
+`leaderboard` enables correctness rechecks and allows up to 1000 repeats. The
+shorter `benchmark` mode is intended for iteration, not final reporting.

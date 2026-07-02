@@ -3,8 +3,9 @@ from __future__ import annotations
 # Kernel provenance: the wide-panel Householder leaf kernels use and adapt
 # gau.nernst's QR2 GPU MODE submission:
 # https://www.gpumode.com/leaderboard/774?tab=rankings
-# Recursive composition, mixed-batch routing, graph orchestration, numerical
-# guards, and the communication-avoiding large-matrix path are extensions here.
+# Recursive panel composition, terminal-tail specializations, conditioning
+# dispatch, graph replay, and the guarded large-matrix path are extensions in
+# this repository.
 
 import torch
 
@@ -2085,6 +2086,7 @@ void qr2_mega_n176_panel(const float* input, float* output, float* tau, float *v
         columns[item][trailing] -= v[item] * dot;
     }
   }
+
   const int panel_id = rank * NUM_WARPS + warp;
   const int local_panel_id = warp;
 
@@ -2768,6 +2770,75 @@ void qr2_mega_n352_p2(const float* input, float* output, float* tau, float *v_fp
 }
 
 '''
+
+def _build_n352_leaf_batched_handoff_source(source: str) -> str:
+    marker = "void qr2_mega_n352_p0"
+    pos = source.index(marker)
+    begin = source.rfind('extern "C" __global__', 0, pos)
+    prefix, body = source[:begin], source[begin:]
+
+    remote_old = """  // from remote reflectors
+  for (int panel = 0; panel < rank * NUM_WARPS; ++panel) {
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      const int col = panel * VEC_SIZE + i;
+      if (warp == 0)
+        mbar_wait(mbars + col * 8, 0);
+      __syncthreads();"""
+    remote_new = """  // Consume one immutable warp leaf per DSM handoff.
+  for (int panel = 0; panel < rank * NUM_WARPS; ++panel) {
+    const int panel_col = panel * VEC_SIZE;
+    mbar_wait(mbars + panel_col * 8, 0);
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      const int col = panel_col + i;"""
+    if body.count(remote_old) != 3:
+        raise RuntimeError("n352 batched consumer markers mismatch")
+    body = body.replace(remote_old, remote_new)
+
+    producer_old = """      if (rank == 0) {
+        const int remote_mbar = (mbars + col * 8) | 0x01000000;
+        mbar_expect_tx(remote_mbar, (ROWS + 1) * 4);
+        tma_s2s(reflector_addr1 + col * ROWS * 4,
+                reflector_addr + local_col * ROWS * 4,
+                ROWS * 4, remote_mbar);
+        st_async_f32(tau_addr1 + col * 4, tau_value, remote_mbar);
+      }"""
+    if body.count(producer_old) != 3:
+        raise RuntimeError("n352 batched producer markers mismatch")
+    body = body.replace(producer_old, "")
+
+    insertion = """  }
+  const int panel_id = rank * NUM_WARPS + warp;"""
+    publication = """  }
+
+  if (rank == 0) {
+    __syncwarp();
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    if (elect_sync()) {
+      const int panel_col = warp * VEC_SIZE;
+      const int remote_mbar = (mbars + panel_col * 8) | 0x01000000;
+      constexpr int PANEL_VALUES = VEC_SIZE * ROWS;
+      mbar_expect_tx(
+          remote_mbar, (PANEL_VALUES + VEC_SIZE) * sizeof(float));
+      tma_s2s(
+          reflector_addr1 + panel_col * ROWS * sizeof(float),
+          reflector_addr + panel_col * ROWS * sizeof(float),
+          PANEL_VALUES * sizeof(float), remote_mbar);
+      #pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j)
+        st_async_f32(
+            tau_addr1 + (panel_col + j) * sizeof(float),
+            taus[panel_col + j], remote_mbar);
+    }
+  }
+  const int panel_id = rank * NUM_WARPS + warp;"""
+    if body.count(insertion) != 3:
+        raise RuntimeError("n352 leaf publication markers mismatch")
+    return prefix + body.replace(insertion, publication)
+
+
+_N352_MEGA_PANEL_SOURCE = _build_n352_leaf_batched_handoff_source(
+    _N352_MEGA_PANEL_SOURCE
+)
 
 _N512_MEGA_PANEL_NAMES = (
     "qr2_mega_n512_p0",
@@ -3791,13 +3862,43 @@ __device__ __forceinline__ void qr2_mega_panel_body(const float* input, float* o
   asm volatile("barrier.cluster.wait.acquire.aligned;");
 
   float columns[ROW_ITEMS][VEC_SIZE];
-  for (int item = 0; item < ROW_ITEMS; ++item) {
-    const int row = item * 32 + lane;
-    const int col = (rank * NUM_WARPS + warp) * VEC_SIZE;
-    if (row < ROWS) {
-      ldg_f32<VEC_SIZE>(columns[item], input + row * N + col);
-    } else {
-      for (int i = 0; i < VEC_SIZE; ++i) columns[item][i] = 0.0f;
+  if constexpr (ROWS >= 928) {
+    // Stage only the early wide panels.  Coalesced row-major float4 loads
+    // remove the scattered per-lane global transactions, while the existing
+    // reflector allocation supplies the transpose buffer at no extra smem.
+    constexpr int LOAD_VECS = ROWS * LOCAL_COLS / 4;
+    for (int q = tid; q < LOAD_VECS; q += blockDim.x) {
+      const int linear = q * 4;
+      const int row = linear / LOCAL_COLS;
+      const int local_col = linear - row * LOCAL_COLS;
+      const int global_col = rank * LOCAL_COLS + local_col;
+      const float4 value = *reinterpret_cast<const float4*>(
+          input + (long long)row * N + global_col);
+      reflectors[(local_col + 0) * ROWS + row] = value.x;
+      reflectors[(local_col + 1) * ROWS + row] = value.y;
+      reflectors[(local_col + 2) * ROWS + row] = value.z;
+      reflectors[(local_col + 3) * ROWS + row] = value.w;
+    }
+    __syncthreads();
+    for (int item = 0; item < ROW_ITEMS; ++item) {
+      const int row = item * 32 + lane;
+      #pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i)
+        columns[item][i] = row < ROWS
+            ? reflectors[(warp * VEC_SIZE + i) * ROWS + row] : 0.0f;
+    }
+    __syncthreads();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+  } else {
+    for (int item = 0; item < ROW_ITEMS; ++item) {
+      const int row = item * 32 + lane;
+      const int col = (rank * NUM_WARPS + warp) * VEC_SIZE;
+      if (row < ROWS) {
+        ldg_f32<VEC_SIZE>(columns[item], input + row * N + col);
+      } else {
+        for (int i = 0; i < VEC_SIZE; ++i) columns[item][i] = 0.0f;
+      }
     }
   }
 
@@ -4209,6 +4310,144 @@ QR2_GMEM_WRAPPER(qr2_mega_n2048_g10, 768, 3)
 '''
 )
 
+def _build_n1024_leaf_batched_handoff_source(source: str) -> str:
+    remote_old = """  // from remote reflectors
+  for (int panel = 0; panel < rank * NUM_WARPS; ++panel) {
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      const int col = panel * VEC_SIZE + i;
+      if (warp == 0)
+        mbar_wait(mbars + col * 8, 0);
+      __syncthreads();"""
+    remote_new = """  // Consume one immutable warp leaf per DSM handoff.
+  for (int panel = 0; panel < rank * NUM_WARPS; ++panel) {
+    const int panel_col = panel * VEC_SIZE;
+    if constexpr (ROWS != 928)
+      mbar_wait(mbars + panel_col * 8, 0);
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      const int col = panel_col + i;
+      if constexpr (ROWS == 928) {
+        if (warp == 0)
+          mbar_wait(mbars + col * 8, 0);
+        __syncthreads();
+      }"""
+    if source.count(remote_old) != 1:
+        raise RuntimeError("n1024 batched consumer marker mismatch")
+    source = source.replace(remote_old, remote_new, 1)
+
+    producer_old = """      if (rank == 0) {
+        const int remote_mbar = (mbars + col * 8) | 0x01000000;
+        mbar_expect_tx(remote_mbar, (ROWS + 1) * 4);
+        tma_s2s(reflector_addr1 + col * ROWS * 4,
+                reflector_addr + local_col * ROWS * 4,
+                ROWS * 4, remote_mbar);
+        st_async_f32(tau_addr1 + col * 4, tau_value, remote_mbar);
+      }"""
+    if source.count(producer_old) != 1:
+        raise RuntimeError("n1024 batched producer marker mismatch")
+    producer_928 = """      if constexpr (ROWS == 928) {
+        if (rank == 0) {
+          const int remote_mbar = (mbars + col * 8) | 0x01000000;
+          mbar_expect_tx(remote_mbar, (ROWS + 1) * 4);
+          tma_s2s(reflector_addr1 + col * ROWS * 4,
+                  reflector_addr + local_col * ROWS * 4,
+                  ROWS * 4, remote_mbar);
+          st_async_f32(tau_addr1 + col * 4, tau_value, remote_mbar);
+        }
+      }"""
+    source = source.replace(producer_old, producer_928, 1)
+
+    insertion = """  }
+  const int panel_id = rank * NUM_WARPS + warp;"""
+    publication = """  }
+
+  // Publish VEC_SIZE completed reflectors as one recursive leaf.  The
+  // consumer acquires the leaf once and reuses its immutable local copy.
+  if constexpr (ROWS != 928) {
+    if (rank == 0) {
+      __syncwarp();
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      if (elect_sync()) {
+        const int panel_col = warp * VEC_SIZE;
+        const int remote_mbar = (mbars + panel_col * 8) | 0x01000000;
+        constexpr int PANEL_VALUES = VEC_SIZE * ROWS;
+        mbar_expect_tx(
+            remote_mbar, (PANEL_VALUES + VEC_SIZE) * sizeof(float));
+        tma_s2s(
+            reflector_addr1 + panel_col * ROWS * sizeof(float),
+            reflector_addr + panel_col * ROWS * sizeof(float),
+            PANEL_VALUES * sizeof(float), remote_mbar);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j)
+          st_async_f32(
+              tau_addr1 + (panel_col + j) * sizeof(float),
+              taus[panel_col + j], remote_mbar);
+      }
+    }
+  }
+  const int panel_id = rank * NUM_WARPS + warp;"""
+    if source.count(insertion) != 1:
+        raise RuntimeError("n1024 leaf publication insertion mismatch")
+    return source.replace(insertion, publication, 1)
+
+
+# Keep the derived n2048 source on its original per-reflector protocol.  Only
+# the n1024 cluster panels use leaf-granular DSM publication.
+_N1024_MEGA_PANEL_SOURCE = _build_n1024_leaf_batched_handoff_source(
+    _N1024_MEGA_PANEL_SOURCE
+)
+
+def _build_n1024_mid_vec4_source(source: str) -> str:
+    old = r'''extern "C" __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(256, 1)
+void qr2_mega_n1024_p5(const float* input, float* output, float* tau, float* v32, __half* v16) {
+  qr2_mega_panel_body<512, 128, 1024, 8>(input, output, tau, v32, v16);
+}'''
+    new = r'''extern "C" __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(512, 1)
+void qr2_mega_n1024_p5(const float* input, float* output, float* tau, float* v32, __half* v16) {
+  qr2_mega_panel_body<512, 128, 1024, 4>(input, output, tau, v32, v16);
+}'''
+    if source.count(old) != 1:
+        raise RuntimeError("n1024 p5 VEC4 wrapper mismatch")
+    source = source.replace(old, new, 1)
+    old = r'''extern "C" __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(256, 1)
+void qr2_mega_n1024_p6(const float* input, float* output, float* tau, float* v32, __half* v16) {
+  qr2_mega_panel_body<384, 128, 1024, 8>(input, output, tau, v32, v16);
+}'''
+    new = r'''extern "C" __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(512, 1)
+void qr2_mega_n1024_p6(const float* input, float* output, float* tau, float* v32, __half* v16) {
+  qr2_mega_panel_body<384, 128, 1024, 4>(input, output, tau, v32, v16);
+}'''
+    if source.count(old) != 1:
+        raise RuntimeError("n1024 p6 VEC4 wrapper mismatch")
+    source = source.replace(old, new, 1)
+    old = r'''extern "C" __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(256, 1)
+void qr2_mega_n1024_p7(const float* input, float* output, float* tau, float* v32, __half* v16) {
+  qr2_mega_panel_body<256, 128, 1024, 8>(input, output, tau, v32, v16);
+}'''
+    new = r'''extern "C" __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(512, 1)
+void qr2_mega_n1024_p7(const float* input, float* output, float* tau, float* v32, __half* v16) {
+  qr2_mega_panel_body<256, 128, 1024, 4>(input, output, tau, v32, v16);
+}'''
+    if source.count(old) != 1:
+        raise RuntimeError("n1024 p7 VEC4 wrapper mismatch")
+    return source.replace(old, new, 1)
+
+
+_N1024_MEGA_PANEL_SOURCE = _build_n1024_mid_vec4_source(
+    _N1024_MEGA_PANEL_SOURCE
+)
+
+_N352_TAIL224_NAME = "qr2_n352_tail224_megakernel"
+
+_N352_TAIL224_SOURCE = _N1024_MEGA_PANEL_SOURCE + r'''
+extern "C" __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(448, 1)
+void qr2_n352_tail224_megakernel(
+    const float* input, float* output, float* tau,
+    float* v32, __half* v16) {
+  qr2_mega_panel_body<224, 224, 352, 8>(
+      input, output, tau, v32, v16);
+}
+'''
+
 _N352_MEGA_T_SOURCE = r'''
 
 #include <cuda_fp16.h>
@@ -4383,35 +4622,41 @@ void build_t64_block(
   build_t32_inverse_block<K>(lower + (32 * K + 32), tau_b + 32, inverse + (32 * K + 32), mid);
   __syncthreads();
 
-  #pragma unroll
-  for (int item = 0; item < 2; ++item) {
-    const int elem = item * TB_SIZE + tid;
-    const int row = elem / 32;
-    const int col = elem - row * 32;
-    float accum = 0.0f;
+  {
+    const int row0 = tid / 32;
+    const int col = tid - row0 * 32;
+    float accum[2] = {};
     #pragma unroll
-    for (int k = 0; k < 32; ++k) {
-      if (k >= col) {
-        accum += lower[(row + 32) * K + k] * inverse[k * K + col];
-      }
+    for (int k = 0; k < 32; ++k) if (k >= col) {
+      const float left[2] = {
+          lower[(row0 + 32) * K + k],
+          lower[(row0 + 16 + 32) * K + k]};
+      const float right[2] = {
+          inverse[k * K + col], inverse[k * K + col]};
+      fma_f32x2(accum, left, right);
     }
-    mid[row * 32 + col] = accum;
+    mid[row0 * 32 + col] = accum[0];
+    mid[(row0 + 16) * 32 + col] = accum[1];
   }
   __syncthreads();
 
-  #pragma unroll
-  for (int item = 0; item < 2; ++item) {
-    const int elem = item * TB_SIZE + tid;
-    const int row = elem / 32;
-    const int col = elem - row * 32;
-    float accum = 0.0f;
+  {
+    const int row0 = tid / 32;
+    const int col = tid - row0 * 32;
+    float accum[2] = {};
     #pragma unroll
     for (int k = 0; k < 32; ++k) {
-      if (k <= row) {
-        accum += inverse[(row + 32) * K + (k + 32)] * mid[k * 32 + col];
-      }
+      const float left[2] = {
+          k <= row0
+              ? inverse[(row0 + 32) * K + k + 32] : 0.0f,
+          k <= row0 + 16
+              ? inverse[(row0 + 16 + 32) * K + k + 32] : 0.0f};
+      const float right[2] = {
+          mid[k * 32 + col], mid[k * 32 + col]};
+      fma_f32x2(accum, left, right);
     }
-    inverse[(row + 32) * K + col] = -accum;
+    inverse[(row0 + 32) * K + col] = -accum[0];
+    inverse[(row0 + 16 + 32) * K + col] = -accum[1];
   }
   __syncthreads();
 
@@ -4608,6 +4853,38 @@ _N2048_WARP224_SOURCE = _N2048_WARP224_SOURCE.replace(
     _N2048_SCALAR_PIVOT_UPDATE, _N2048_PACKED_PIVOT_UPDATE, 1
 )
 
+_N2048_WARP224_SOURCE = _build_n1024_leaf_batched_handoff_source(
+    _N2048_WARP224_SOURCE
+)
+
+def _build_n2048_tail_vec4_source(source: str) -> str:
+    for index, rows in ((5, 512), (6, 384), (7, 256)):
+        old = (
+            'extern "C" __global__ __cluster_dims__(2, 1, 1) '
+            '__launch_bounds__(256, 1)\n'
+            f'void qr2_mega_n2048_p{index}(const float* input, '
+            'float* output, float* tau, float* v32, __half* v16) {\n'
+            f'  qr2_mega_panel_body<{rows}, 128, 2048, 8>'
+            '(input, output, tau, v32, v16);\n}'
+        )
+        new = (
+            'extern "C" __global__ __cluster_dims__(2, 1, 1) '
+            '__launch_bounds__(512, 1)\n'
+            f'void qr2_mega_n2048_p{index}(const float* input, '
+            'float* output, float* tau, float* v32, __half* v16) {\n'
+            f'  qr2_mega_panel_body<{rows}, 128, 2048, 4>'
+            '(input, output, tau, v32, v16);\n}'
+        )
+        if source.count(old) != 1:
+            raise RuntimeError(f"n2048 p{index} VEC4 wrapper mismatch")
+        source = source.replace(old, new, 1)
+    return source
+
+
+_N2048_WARP224_SOURCE = _build_n2048_tail_vec4_source(
+    _N2048_WARP224_SOURCE
+)
+
 class _N2048Warp224Launch:
     def __init__(self, kernel, warps: int):
         self.kernel = kernel
@@ -4679,6 +4956,13 @@ def _n352_mega_panel_kernels():
     return tuple(CUDAKernel(image, name) for name in _N352_MEGA_PANEL_NAMES)
 
 @memo(maxsize=1)
+def _n352_tail224_kernel():
+    return CUDAKernel(
+        _fast_nvrtc_compile(_N352_TAIL224_SOURCE, _N352_TAIL224_NAME),
+        _N352_TAIL224_NAME,
+    )
+
+@memo(maxsize=1)
 def _n352_mega_t_image():
     return _fast_nvrtc_compile(_N352_MEGA_T_SOURCE, "qr2_mega_t128")
 
@@ -4686,6 +4970,13 @@ def _n352_mega_t_image():
 def _n352_mega_t_kernels():
     image = _n352_mega_t_image()
     return CUDAKernel(image, "qr2_mega_t128"), CUDAKernel(image, "qr2_mega_t96")
+
+def _complete_compact_wy_cross(gram, tt):
+    mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
+    torch.baddbmm(
+        tt[:, 64:, :64], tt[:, 64:, 64:], mid,
+        beta=0.0, alpha=-1.0, out=tt[:, 64:, :64],
+    )
 
 def _n352_mega_inplace(data):
     batch = int(data.shape[0])
@@ -4699,6 +4990,15 @@ def _n352_mega_inplace(data):
     torch.set_float32_matmul_precision("high")
     for index, width in enumerate(widths):
         rows = 352 - offset
+        if index == 1:
+            square = h[:, offset:, offset:]
+            _n352_tail224_kernel().launch(
+                grid=(batch * 2, 1, 1),
+                block=(448, 1, 1),
+                shared_mem=(224 * 112 + 224) * 4 + 224 * 8,
+                args=[square, square, tau[:, offset:], square, square],
+            )
+            break
         panel = h[:, offset:, offset : offset + width]
         if offset + width < 352:
             v32 = h.new_empty(batch, width, rows).transpose(1, 2)
@@ -4725,15 +5025,7 @@ def _n352_mega_inplace(data):
                 shared_mem=36864,
                 args=[gram, panel_tau, tt, int(tau.stride(0))],
             )
-            mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-            torch.baddbmm(
-                tt[:, 64:, :64],
-                tt[:, 64:, 64:],
-                mid,
-                beta=0.0,
-                alpha=-1.0,
-                out=tt[:, 64:, :64],
-            )
+            _complete_compact_wy_cross(gram, tt)
             trailing = h[:, offset:, offset + width :]
             projected = torch.bmm(v32.transpose(1, 2), trailing)
             transformed = torch.bmm(tt, projected)
@@ -4836,15 +5128,7 @@ def _n512_mega_active_inplace(
                 shared_mem=36864,
                 args=[gram, panel_tau, tt, int(tau.stride(0))],
             )
-            mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-            torch.baddbmm(
-                tt[:, 64:, :64],
-                tt[:, 64:, 64:],
-                mid,
-                beta=0.0,
-                alpha=-1.0,
-                out=tt[:, 64:, :64],
-            )
+            _complete_compact_wy_cross(gram, tt)
             trailing_input = source[:, offset:, offset + width : active_cols]
             trailing_output = h[:, offset:, offset + width : active_cols]
             projected = torch.bmm(v32.transpose(1, 2), trailing_input)
@@ -4995,15 +5279,7 @@ def _n512_mega_full_inplace(
                 shared_mem=36864,
                 args=[gram, panel_tau, tt, int(tau.stride(0))],
             )
-            mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-            torch.baddbmm(
-                tt[:, 64:, :64],
-                tt[:, 64:, 64:],
-                mid,
-                beta=0.0,
-                alpha=-1.0,
-                out=tt[:, 64:, :64],
-            )
+            _complete_compact_wy_cross(gram, tt)
             trailing = h[:, offset:, offset + width :]
             torch.set_float32_matmul_precision("high")
             projected = torch.bmm(v32.transpose(1, 2), trailing)
@@ -5050,10 +5326,71 @@ def _n1024_mega_panel_kernels():
     image = _n1024_mega_panel_image()
     return tuple(CUDAKernel(image, name) for name in _N1024_MEGA_PANEL_NAMES)
 
-_N176_VEC4_SOURCE = (
-    _N176_MEGA_SOURCE
-    .replace("__launch_bounds__(352, 1)", "__launch_bounds__(704, 1)", 1)
-    .replace("VEC_SIZE=8", "VEC_SIZE=4", 1)
+_N176_VEC4_SOURCE = _N176_MEGA_SOURCE
+
+def _build_n176_leaf_batched_handoff_source(source: str) -> str:
+    remote_old = """  // from remote reflectors
+  for (int panel = 0; panel < rank * NUM_WARPS; ++panel) {
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      const int col = panel * VEC_SIZE + i;
+      if (warp == 0)
+        mbar_wait(mbars + col * 8, 0);
+      __syncthreads();"""
+    remote_new = """  // Consume one immutable warp leaf per DSM handoff.
+  for (int panel = 0; panel < rank * NUM_WARPS; ++panel) {
+    const int panel_col = panel * VEC_SIZE;
+    mbar_wait(mbars + panel_col * 8, 0);
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      const int col = panel_col + i;"""
+    if source.count(remote_old) != 1:
+        raise RuntimeError("n176 batched consumer marker mismatch")
+    source = source.replace(remote_old, remote_new, 1)
+
+    producer_old = """      if (rank == 0) {
+        const int remote_mbar = (mbars + col * 8) | 0x01000000;
+        mbar_expect_tx(remote_mbar, (ROWS + 1) * 4);
+        tma_s2s(reflector_addr1 + col * ROWS * 4,
+                reflector_addr + local_col * ROWS * 4,
+                ROWS * 4, remote_mbar);
+        st_async_f32(tau_addr1 + col * 4, tau_value, remote_mbar);
+      }"""
+    if source.count(producer_old) != 1:
+        raise RuntimeError("n176 batched producer marker mismatch")
+    source = source.replace(producer_old, "", 1)
+
+    insertion = """  }
+
+  const int panel_id = rank * NUM_WARPS + warp;"""
+    publication = """  }
+
+  if (rank == 0) {
+    __syncwarp();
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    if (elect_sync()) {
+      const int panel_col = warp * VEC_SIZE;
+      const int remote_mbar = (mbars + panel_col * 8) | 0x01000000;
+      constexpr int PANEL_VALUES = VEC_SIZE * ROWS;
+      mbar_expect_tx(
+          remote_mbar, (PANEL_VALUES + VEC_SIZE) * sizeof(float));
+      tma_s2s(
+          reflector_addr1 + panel_col * ROWS * sizeof(float),
+          reflector_addr + panel_col * ROWS * sizeof(float),
+          PANEL_VALUES * sizeof(float), remote_mbar);
+      #pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j)
+        st_async_f32(
+            tau_addr1 + (panel_col + j) * sizeof(float),
+            taus[panel_col + j], remote_mbar);
+    }
+  }
+  const int panel_id = rank * NUM_WARPS + warp;"""
+    if source.count(insertion) != 1:
+        raise RuntimeError("n176 leaf publication marker mismatch")
+    return source.replace(insertion, publication, 1)
+
+
+_N176_VEC4_SOURCE = _build_n176_leaf_batched_handoff_source(
+    _N176_VEC4_SOURCE
 )
 
 class _N176Vec4Launch:
@@ -5061,7 +5398,7 @@ class _N176Vec4Launch:
         self.kernel = kernel
 
     def launch(self, **kwargs):
-        kwargs["block"] = (704, 1, 1)
+        kwargs["block"] = (352, 1, 1)
         return self.kernel.launch(**kwargs)
 
 @memo(maxsize=1)
@@ -5105,8 +5442,8 @@ def _n1024_recursive_factor(h, tau, index: int, offset: int, width: int):
         v16 = h
     specs = (
         (1024, 96, 4), (928, 96, 4), (832, 96, 4), (736, 96, 4),
-        (640, 128, 8), (512, 128, 8), (384, 128, 8),
-        (256, 128, 8), (128, 128, 8),
+        (640, 128, 8), (512, 128, 4), (384, 128, 4),
+        (256, 128, 4), (128, 128, 8),
     )
     _, _, vec = specs[index]
     _n1024_mega_panel_kernels()[index].launch(
@@ -5128,15 +5465,7 @@ def _n1024_recursive_factor(h, tau, index: int, offset: int, width: int):
         shared_mem=36864,
         args=[gram, panel_tau, tt, int(tau.stride(0))],
     )
-    mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-    torch.baddbmm(
-        tt[:, 64:, :64],
-        tt[:, 64:, 64:],
-        mid,
-        beta=0.0,
-        alpha=-1.0,
-        out=tt[:, 64:, :64],
-    )
+    _complete_compact_wy_cross(gram, tt)
     return v32, v16, tt
 
 def _n1024_recursive_apply(h, factors, offset: int, width: int) -> None:
@@ -5369,9 +5698,11 @@ def _n2048_recursive_factor(h, tau, index: int, offset: int):
             args=[panel, panel, panel_tau, v32, v16, flags],
         )
     else:
-        tail_panels[index - 11].launch(
+        tail_index = index - 11
+        tail_vec = 4 if tail_index in (1, 2, 3) else 8
+        tail_panels[tail_index].launch(
             grid=(batch * 2, 1, 1),
-            block=(256, 1, 1),
+            block=((128 // tail_vec // 2) * 32, 1, 1),
             shared_mem=(rows * 64 + 128) * 4 + 128 * 8,
             args=[panel, panel, panel_tau, v32, v16],
         )
@@ -5388,15 +5719,7 @@ def _n2048_recursive_factor(h, tau, index: int, offset: int):
         shared_mem=36864,
         args=[gram, panel_tau, tt, int(tau.stride(0))],
     )
-    mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-    torch.baddbmm(
-        tt[:, 64:, :64],
-        tt[:, 64:, 64:],
-        mid,
-        beta=0.0,
-        alpha=-1.0,
-        out=tt[:, 64:, :64],
-    )
+    _complete_compact_wy_cross(gram, tt)
     return v32, v16, tt
 
 def _n2048_recursive_apply(
@@ -6180,15 +6503,7 @@ def _n512_mega_full_precise(data, tau):
                 shared_mem=36864,
                 args=[gram, panel_tau, tt, int(tau.stride(0))],
             )
-            mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-            torch.baddbmm(
-                tt[:, 64:, :64],
-                tt[:, 64:, 64:],
-                mid,
-                beta=0.0,
-                alpha=-1.0,
-                out=tt[:, 64:, :64],
-            )
+            _complete_compact_wy_cross(gram, tt)
             trailing = h[:, offset:, offset + width :]
             torch.set_float32_matmul_precision(
                 "highest" if offset == 0 else "high"
@@ -6592,6 +6907,7 @@ def _build_caqr_fused_qtop_lu_source() -> str:
     source = source.replace(
         "    float* __restrict__ signs_out,\n    int rows)",
         "    float* __restrict__ signs_out,\n"
+        "    float* __restrict__ t_out,\n"
         "    int panel_k0,\n    int r_batch_stride,\n"
         "    int r_row_stride,\n    int r_col_stride)",
         1,
@@ -6653,7 +6969,42 @@ def _build_caqr_fused_qtop_lu_source() -> str:
     __syncthreads();'''
     if source.count(old) != 1:
         raise RuntimeError("fused n4096 qtop/LU source mismatch")
-    return source.replace(old, new, 1)
+    source = source.replace(old, new, 1)
+    old_tail = '''    for (int col = tid; col < B; col += blockDim.x)
+        signs_out[matrix * B + col] = signs[col];
+}'''
+    new_tail = '''    for (int col = tid; col < B; col += blockDim.x)
+        signs_out[matrix * B + col] = signs[col];
+    __syncthreads();
+
+    // Reuse the resident L/U factors to build compact-WY T.  Eight lanes
+    // cooperate on each of the 64 right-hand sides, replacing the separate
+    // triangular-solve and transpose kernels without serializing the solve.
+    const int rhs = tid >> 3;
+    #pragma unroll
+    for (int block8 = 0; block8 < 8; ++block8) solved[block8] = 0.0f;
+    #pragma unroll
+    for (int row = 0; row < B; ++row) {
+        float value = lane8 == 0 ? u[rhs * B + row] : 0.0f;
+        #pragma unroll
+        for (int block8 = 0; block8 < 8; ++block8) {
+            const int p = block8 * 8 + lane8;
+            if (p < row)
+                value = fmaf(-l[row * B + p], solved[block8], value);
+        }
+        value += __shfl_down_sync(0xffffffffu, value, 4, 8);
+        value += __shfl_down_sync(0xffffffffu, value, 2, 8);
+        value += __shfl_down_sync(0xffffffffu, value, 1, 8);
+        const float x = __shfl_sync(0xffffffffu, value, 0, 8);
+        if (lane8 == (row & 7)) solved[row >> 3] = x;
+    }
+    #pragma unroll
+    for (int block8 = 0; block8 < 8; ++block8)
+        t_out[out_base + rhs * B + block8 * 8 + lane8] = solved[block8];
+}'''
+    if source.count(old_tail) != 1:
+        raise RuntimeError("fused n4096 Qtop/LU/T tail mismatch")
+    return source.replace(old_tail, new_tail, 1)
 
 _CAQR_CHOLESKY64_SOURCE = r'''
 __device__ __forceinline__ float qr2_sqrt_rn(float x) {
@@ -6905,6 +7256,7 @@ def _caqr_factor_panel64(h, tau, k0: int):
     torch.set_float32_matmul_precision("highest")
     l = torch.empty((batch, _CAQR_PANEL, _CAQR_PANEL), device=h.device, dtype=torch.float32)
     u = torch.empty_like(l)
+    t = torch.empty_like(l)
     signs = torch.empty((batch, _CAQR_PANEL), device=h.device, dtype=torch.float32)
     _caqr_fused_qtop_lu_kernel().launch(
         grid=(batch, 1, 1),
@@ -6916,6 +7268,7 @@ def _caqr_factor_panel64(h, tau, k0: int):
             l,
             u,
             signs,
+            t,
             int(k0),
             int(r.stride(0)),
             int(r.stride(1)),
@@ -6947,12 +7300,6 @@ def _caqr_factor_panel64(h, tau, k0: int):
             int(tau_panel.stride(0)),
         ],
     )
-    t = torch.linalg.solve_triangular(
-        l,
-        u.transpose(1, 2),
-        upper=False,
-        unitriangular=True,
-    ).transpose(1, 2).contiguous()
     return v, t
 
 def _caqr_apply_panel64(h, v, t, k0: int, update_cols: int):
@@ -7496,7 +7843,59 @@ def _n512_rhh_leaf_source(name: str, rows: int) -> str:
         body = body[:begin] + direct + body[end:]
     return head + body + marker + rest
 
-_N512_RHH_LEFT_NAME = "qr2_n512_rhh_leaf512x48"
+def _n512_rhh_left_vec4_source(name: str) -> str:
+    source = _n512_rhh_leaf_source(name, 512)
+    start = source.index(f"void {name}(")
+    begin = source.rfind('extern "C" __global__', 0, start)
+    end = source.index('extern "C" __global__', start)
+    head, body, tail = source[:begin], source[begin:end], source[end:]
+    body = body.replace(
+        "constexpr int ROWS=512, COLS=48, N=512;",
+        "constexpr int ROWS=512, COLS=48, N=512, VEC_SIZE=4;",
+        1,
+    )
+    replacements = (
+        ("static_assert(COLS % 8 == 0);",
+         "static_assert(COLS % VEC_SIZE == 0);"),
+        ("float columns[ROW_ITEMS][8];",
+         "float columns[ROW_ITEMS][VEC_SIZE];"),
+        ("ldg_f32<8>(columns[item], input + row * N + warp * 8);",
+         "ldg_f32<VEC_SIZE>(columns[item], input + row * N + "
+         "warp * VEC_SIZE);"),
+        ("for (int i = 0; i < 8; ++i) columns[item][i] = 0.0f;",
+         "for (int i = 0; i < VEC_SIZE; ++i) "
+         "columns[item][i] = 0.0f;"),
+        ("const int col = panel * 8 + i;",
+         "const int col = panel * VEC_SIZE + i;"),
+        ("for (int pair = 0; pair < 4; ++pair)",
+         "for (int pair = 0; pair < VEC_SIZE / 2; ++pair)"),
+        ("for (int i = 0; i < 8; ++i) {",
+         "for (int i = 0; i < VEC_SIZE; ++i) {"),
+        ("const int col = warp * 8 + i;",
+         "const int col = warp * VEC_SIZE + i;"),
+        ("trailing_col < 8", "trailing_col < VEC_SIZE"),
+        ("constexpr int PANEL_SIZE = 8 * ROWS;",
+         "constexpr int PANEL_SIZE = VEC_SIZE * ROWS;"),
+        ("idx < ROWS * 8", "idx < PANEL_SIZE"),
+        ("if (lane < 2) {", "if (lane < VEC_SIZE / 4) {"),
+        ("[warp * 2 + lane]",
+         "[warp * (VEC_SIZE / 4) + lane]"),
+        ("(warp * 2 + lane) * 4",
+         "(warp * (VEC_SIZE / 4) + lane) * 4"),
+        ("output + row * N + warp * 8",
+         "output + row * N + warp * VEC_SIZE"),
+        ("stg_f32<8>(output + row * N + warp * VEC_SIZE, columns[item]);",
+         "stg_f32<VEC_SIZE>(output + row * N + warp * VEC_SIZE, "
+         "columns[item]);"),
+    )
+    for old, new in replacements:
+        if old not in body:
+            raise RuntimeError(f"n512 VEC4 left-leaf marker missing: {old}")
+        body = body.replace(old, new)
+    return head + body + tail
+
+
+_N512_RHH_LEFT_NAME = "qr2_n512_rhh_leaf512x48_vec4"
 
 _N512_RHH_RIGHT_NAME = "qr2_n512_rhh_leaf464x48"
 
@@ -7504,7 +7903,7 @@ _N512_RHH_RIGHT_NAME = "qr2_n512_rhh_leaf464x48"
 def _n512_rhh_left_leaf():
     return CUDAKernel(
         _fast_nvrtc_compile(
-            _n512_rhh_leaf_source(_N512_RHH_LEFT_NAME, 512),
+            _n512_rhh_left_vec4_source(_N512_RHH_LEFT_NAME),
             _N512_RHH_LEFT_NAME,
         ),
         _N512_RHH_LEFT_NAME,
@@ -7522,8 +7921,8 @@ def _n512_rhh_right_leaf():
 
 _N512_RHH_T48_NAME = "qr2_n512_rhh_t48"
 
-_N512_RHH_T48_SOURCE = r'''
-extern "C" __global__ __launch_bounds__(64, 1) void
+_N512_RHH_T48_SOURCE = _N352_MEGA_T_SOURCE + r'''
+extern "C" __global__ __launch_bounds__(512, 1) void
 qr2_n512_rhh_t48(const float* __restrict__ gram,
                  const float* __restrict__ tau,
                  float* __restrict__ output, long long tau_stride) {
@@ -7533,22 +7932,77 @@ qr2_n512_rhh_t48(const float* __restrict__ gram,
   tau+=(long long)batch*tau_stride;
   output+=(long long)batch*N*N;
   extern __shared__ float storage[];
-  float* g=storage;
-  float* t=g+N*N;
-  for(int e=tid;e<N*N;e+=blockDim.x) { g[e]=gram[e]; t[e]=0.f; }
+  float* lower=storage;
+  float* inverse=lower+N*N;
+  float* mid=inverse+N*N;
+  for(int e=tid;e<N*N;e+=blockDim.x) {
+    const int row=e/N,col=e-row*N;
+    lower[e]=col<row?gram[e]:0.f;
+    inverse[e]=0.f;
+  }
   __syncthreads();
-  if(tid<N) {
-    const int col=tid;
-    #pragma unroll 1
-    for(int row=col;row<N;++row) {
-      float value=row==col?1.f:0.f;
-      #pragma unroll 1
-      for(int k=col;k<row;++k)
-        value=fmaf(-g[row*N+k],t[k*N+col],value);
-      t[row*N+col]=value*tau[row];
+
+  build_t32_inverse_block<N>(lower,tau,inverse,mid);
+  __syncthreads();
+
+  const int warp=tid/32,lane=tid&31;
+  if(warp<8) {
+    const int half=lane>>4,sublane=lane&15;
+    const int local_col=warp*2+half;
+    float x=0.f;
+    #pragma unroll
+    for(int row=0;row<16;++row) {
+      float partial=lower[(32+row)*N+32+sublane]*x;
+      partial=warp_sum(partial,16);
+      const float value=
+          ((row==local_col?1.f:0.f)-partial)*tau[32+row];
+      if(row==sublane) {
+        x=value;
+        inverse[(32+row)*N+32+local_col]=value;
+      }
     }
-    for(int row=0;row<N;++row)
-      output[row*N+col]=row<col?0.f:t[row*N+col];
+  }
+  __syncthreads();
+
+  if(tid<256) {
+    const int row0=tid/32,col=tid&31;
+    float accum[2]={};
+    #pragma unroll
+    for(int k=0;k<32;++k) {
+      const float left[2]={
+          lower[(32+row0)*N+k],lower[(32+row0+8)*N+k]};
+      const float right[2]={inverse[k*N+col],inverse[k*N+col]};
+      fma_f32x2(accum,left,right);
+    }
+    mid[row0*32+col]=accum[0];
+    mid[(row0+8)*32+col]=accum[1];
+  }
+  __syncthreads();
+
+  if(tid<256) {
+    const int row0=tid/32,col=tid&31;
+    float accum[2]={};
+    #pragma unroll
+    for(int k=0;k<16;++k) {
+      const float left[2]={
+          k<=row0?inverse[(32+row0)*N+32+k]:0.f,
+          k<=row0+8?inverse[(32+row0+8)*N+32+k]:0.f};
+      const float right[2]={mid[k*32+col],mid[k*32+col]};
+      fma_f32x2(accum,left,right);
+    }
+    inverse[(32+row0)*N+col]=-accum[0];
+    inverse[(32+row0+8)*N+col]=-accum[1];
+  }
+  __syncthreads();
+
+  constexpr int PACKS=N*(N/4);
+  for(int pack=tid;pack<PACKS;pack+=blockDim.x) {
+    const int row=pack/(N/4),col=(pack-row*(N/4))*4;
+    float values[4];
+    #pragma unroll
+    for(int j=0;j<4;++j)
+      values[j]=(col+j)<=row?inverse[row*N+col+j]:0.f;
+    stg_f32<4>(output+row*N+col,values);
   }
 }
 '''
@@ -7600,15 +8054,15 @@ def _n512_rhh_p0_io(source, output, tau):
     ).transpose(1, 2)
     v0, h0 = v96[:, :, :48], h96[:, :, :48]
     _n512_rhh_left_leaf().launch(
-        grid=(batch, 1, 1), block=(192, 1, 1),
+        grid=(batch, 1, 1), block=(384, 1, 1),
         shared_mem=(512 * 48 + 48) * 4 + 48 * 8,
         args=[source, output, tau, v96, h96],
     )
     gram = torch.bmm(h0.transpose(1, 2), h0, out_dtype=torch.float32)
     t0 = torch.empty_like(gram)
     _n512_rhh_t48_kernel().launch(
-        grid=(batch, 1, 1), block=(64, 1, 1),
-        shared_mem=2 * 48 * 48 * 4,
+        grid=(batch, 1, 1), block=(512, 1, 1),
+        shared_mem=20480,
         args=[gram, tau, t0, int(tau.stride(0))],
     )
     right_input = source[:, :, 48:96]
@@ -7729,8 +8183,8 @@ def _n512_rhh_p1(h, tau):
     )
     t0 = torch.empty_like(gram)
     _n512_rhh_t48_kernel().launch(
-        grid=(batch, 1, 1), block=(64, 1, 1),
-        shared_mem=2 * 48 * 48 * 4,
+        grid=(batch, 1, 1), block=(512, 1, 1),
+        shared_mem=20480,
         args=[gram, parent_tau, t0, int(tau.stride(0))],
     )
     right_panel = h[:, 96:, 144:192]
@@ -7764,11 +8218,7 @@ def _n512_rhh_p3(h, tau, t96_kernel):
         grid=(batch, 1, 1), block=(512, 1, 1), shared_mem=36864,
         args=[gram, tau[:, 320:416], tt, int(tau.stride(0))],
     )
-    mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-    torch.baddbmm(
-        tt[:, 64:, :64], tt[:, 64:, 64:], mid,
-        beta=0.0, alpha=-1.0, out=tt[:, 64:, :64],
-    )
+    _complete_compact_wy_cross(gram, tt)
     right = h[:, 320:, 416:]
     projected = torch.bmm(v0.transpose(1, 2), right)
     transformed = torch.bmm(tt, projected)
@@ -7781,6 +8231,69 @@ def _n512_rhh_p3(h, tau, t96_kernel):
         grid=(batch, 1, 1), block=(384, 1, 1),
         shared_mem=(96 * 96 + 96) * 4 + 96 * 8,
         args=[square, square, tau[:, 416:], square, square],
+    )
+
+_N512_RHH_ACTIVE384_LEFT_NAME = "qr2_n512_rhh_active384_left320x96"
+
+_N512_RHH_ACTIVE384_RIGHT_NAME = "qr2_n512_rhh_active384_right224x96"
+
+@memo(maxsize=1)
+def _n512_rhh_active384_left_leaf():
+    return CUDAKernel(
+        _fast_nvrtc_compile(
+            _n512_rhh_plain_leaf_source(
+                _N512_RHH_ACTIVE384_LEFT_NAME, 320, 96
+            ),
+            _N512_RHH_ACTIVE384_LEFT_NAME,
+        ),
+        _N512_RHH_ACTIVE384_LEFT_NAME,
+    )
+
+@memo(maxsize=1)
+def _n512_rhh_active384_right_leaf():
+    source = _n512_rhh_plain_leaf_source(
+        _N512_RHH_ACTIVE384_RIGHT_NAME, 224, 96
+    ).replace(
+        "if constexpr (ROWS > COLS) {",
+        "if constexpr (ROWS > COLS && ROWS != 224) {",
+    )
+    return CUDAKernel(
+        _fast_nvrtc_compile(source, _N512_RHH_ACTIVE384_RIGHT_NAME),
+        _N512_RHH_ACTIVE384_RIGHT_NAME,
+    )
+
+def _n512_rhh_active384_tail(h, tau, t96_kernel):
+    """Factor the final 320x192 active tail as a recursive 96+96 node."""
+    batch = int(h.shape[0])
+    left = h[:, 192:, 192:288]
+    v96 = h.new_empty(batch, 96, 320).transpose(1, 2)
+    h96 = h.new_empty(
+        batch, 96, 320, dtype=torch.float16
+    ).transpose(1, 2)
+    _n512_rhh_active384_left_leaf().launch(
+        grid=(batch, 1, 1), block=(384, 1, 1),
+        shared_mem=(320 * 96 + 96) * 4 + 96 * 8,
+        args=[left, left, tau[:, 192:288], v96, h96],
+    )
+    gram = torch.bmm(h96.transpose(1, 2), h96, out_dtype=torch.float32)
+    tt = torch.empty_like(gram)
+    t96_kernel.launch(
+        grid=(batch, 1, 1), block=(512, 1, 1), shared_mem=36864,
+        args=[gram, tau[:, 192:288], tt, int(tau.stride(0))],
+    )
+    _complete_compact_wy_cross(gram, tt)
+    right = h[:, 192:, 288:384]
+    projected = torch.bmm(v96.transpose(1, 2), right)
+    transformed = torch.bmm(tt, projected)
+    torch.baddbmm(
+        right, h96, transformed.half(), beta=1.0, alpha=-1.0,
+        out=right, out_dtype=torch.float32,
+    )
+    square = h[:, 288:, 288:384]
+    _n512_rhh_active384_right_leaf().launch(
+        grid=(batch, 1, 1), block=(384, 1, 1),
+        shared_mem=(224 * 96 + 96) * 4 + 96 * 8,
+        args=[square, square, tau[:, 288:384], square, square],
     )
 
 _n512_mega_full_inplace_before_rhh = _n512_mega_full_inplace
@@ -7833,11 +8346,7 @@ def _n512_mega_full_inplace(
                 block=(512, 1, 1), shared_mem=36864,
                 args=[gram, panel_tau, tt, int(tau.stride(0))],
             )
-            mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-            torch.baddbmm(
-                tt[:, 64:, :64], tt[:, 64:, 64:], mid,
-                beta=0.0, alpha=-1.0, out=tt[:, 64:, :64],
-            )
+            _complete_compact_wy_cross(gram, tt)
             trailing = h[:, offset:, offset + width:]
             projected = torch.bmm(v32.transpose(1, 2), trailing)
             transformed = torch.bmm(tt, projected)
@@ -7855,10 +8364,6 @@ def _n512_mega_active_inplace(
 ):
     active_cols = int(active_cols)
     batch = int(data.shape[0])
-    if active_cols == 256:
-        return _n512_mega_active_inplace_before_rhh(
-            data, active_cols, tau=tau, h=h, initialize=initialize
-        )
     if h is None:
         h = torch.zeros_like(data)
     elif bool(initialize):
@@ -7870,7 +8375,10 @@ def _n512_mega_active_inplace(
     panels = _n512_mega_panel_kernels()
     active320, active192 = _n512_mega_active_kernels()
     t128, t96 = _n352_mega_t_kernels()
-    widths = (96, 96, 128, 64)
+    widths = (
+        (96, 96, 64) if active_cols == 256
+        else (96, 96, 128, 64)
+    )
     source = data
     offset = 0
     torch.set_float32_matmul_precision("high")
@@ -7879,14 +8387,22 @@ def _n512_mega_active_inplace(
         panel_input = source[:, offset:, offset:offset + width]
         panel_output = h[:, offset:, offset:offset + width]
         panel_tau = tau[:, offset:offset + width]
+        if active_cols == 384 and index == 2:
+            _n512_rhh_active384_tail(h, tau, t96)
+            break
         if index == 0:
             v32, v16 = _n512_rhh_p0_io(source, h, tau)
+        elif index == 1:
+            v32, v16 = _n512_rhh_p1(h, tau)
         else:
             v32 = h.new_empty(batch, width, rows).transpose(1, 2)
             v16 = h.new_empty(
                 batch, width, rows, dtype=torch.float16
             ).transpose(1, 2)
-            kernel = active192 if width == 64 else panels[index]
+            kernel = (
+                (active320 if rows == 320 else active192)
+                if width == 64 else panels[index]
+            )
             kernel.launch(
                 grid=(batch, 1, 1), block=((width // 8) * 32, 1, 1),
                 shared_mem=(rows * width + width) * 4 + width * 8,
@@ -7902,11 +8418,7 @@ def _n512_mega_active_inplace(
                 block=(512, 1, 1), shared_mem=36864,
                 args=[gram, panel_tau, tt, int(tau.stride(0))],
             )
-            mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-            torch.baddbmm(
-                tt[:, 64:, :64], tt[:, 64:, 64:], mid,
-                beta=0.0, alpha=-1.0, out=tt[:, 64:, :64],
-            )
+            _complete_compact_wy_cross(gram, tt)
             trailing_input = source[:, offset:, offset + width:active_cols]
             trailing_output = h[:, offset:, offset + width:active_cols]
             projected = torch.bmm(v32.transpose(1, 2), trailing_input)
@@ -8054,11 +8566,7 @@ def _n1024_rhh_leaf_factor(
         grid=(batch, 1, 1), block=(512, 1, 1), shared_mem=36864,
         args=[gram, panel_tau, tt, int(tau.stride(0))],
     )
-    mid = torch.bmm(gram[:, 64:, :64], tt[:, :64, :64])
-    torch.baddbmm(
-        tt[:, 64:, :64], tt[:, 64:, 64:], mid,
-        beta=0.0, alpha=-1.0, out=tt[:, 64:, :64],
-    )
+    _complete_compact_wy_cross(gram, tt)
     return v, vh, tt
 
 def _n1024_recursive_pair96(h, tau, index: int, offset: int) -> None:

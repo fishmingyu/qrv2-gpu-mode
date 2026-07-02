@@ -1,94 +1,78 @@
-# Algorithm: Blocked and Recursive Householder QR
+# Algorithm and Terminology
 
-This document separates three layers that are easy to conflate:
+This implementation combines four ideas whose boundaries matter:
 
-1. **blocked Householder QR**, the mathematical compact-WY baseline;
-2. **recursive Householder composition**, used to build larger panels from
-   GPU-friendly leaves;
-3. **mega-panel CUDA kernels**, which implement each leaf efficiently.
+1. blocked Householder QR and compact WY;
+2. recursive Householder panel decomposition;
+3. fused **panel** megakernels;
+4. a guarded Gram/CholeskyQR-style specialization for the n4096 benchmark.
 
-The `4096 x 4096` specialization uses a fourth component: a guarded
-communication-avoiding QR path.
+CUDA Graph replay is an execution mechanism around those algorithms, not a
+fifth QR algorithm and not a form of kernel fusion.
 
 ## 1. Blocked Householder QR
 
-For column `i`, a Householder reflector has the form
+For column `i`, a Householder reflector is
 
 ```math
 H_i = I - \tau_i v_i v_i^T.
 ```
 
-A panel of width `b` produces `b` reflectors. Compact WY represents their
-product as
+Factoring a panel of width `b` produces `b` reflectors. Compact WY represents
+their product as
 
 ```math
 Q_p = H_0 H_1 \cdots H_{b-1} = I - V T V^T,
 ```
 
-where `V = [v_0, v_1, ..., v_{b-1}]` and `T` is a small triangular matrix.
-The trailing update then uses level-3 matrix operations:
-
-```math
-A_{trail} \leftarrow Q_p^T A_{trail}.
-```
+where `V = [v_0, ..., v_{b-1}]` and `T` is a small triangular factor. A
+blocked QR applies that transform to the trailing matrix with level-3 matrix
+operations.
 
 ```mermaid
 flowchart LR
-    A[Panel of b columns] --> S[Sequential reflector chain]
-    S --> V[Packed V and tau]
-    V --> T[Build triangular T]
-    T --> U[Large trailing update]
-    R[Trailing matrix] --> U
+    A[Panel] --> F[Sequential reflector chain]
+    F --> V[Compact H, tau and update V]
+    V --> T[Build compact-WY T]
+    T --> U[Trailing matrix update]
 ```
 
-Blocking makes the large trailing update efficient, but reflector `i+1` still
-depends on the panel update from reflector `i`.
+Blocking does not remove the dependency between reflectors inside the panel:
+reflector `i + 1` needs the panel state updated by reflector `i`. A wider panel
+creates fewer, larger trailing updates, but lengthens that serial chain and
+increases register/shared-memory pressure.
 
-```text
-factor_panel(A, b):
-    for i = 0 .. b-1:
-        form (v_i, tau_i)
-        update the remaining columns in the panel
-    build T from all b reflectors
-    apply (V, T) to the far trailing matrix
-```
+In this repository, “flat blocked Householder” means that one leaf kernel
+factors all `b` columns before the external compact-WY update.
 
-On a GPU, making `b` large improves the trailing GEMMs but increases the live
-panel state, synchronization chain, register pressure, and shared-memory
-footprint. Making `b` small causes too many launches and too little work per
-launch.
+## 2. Recursive Householder panels
 
-## 2. Recursive Householder composition
+For a panel split as `b = b0 + b1`:
 
-For a panel of width `b = b0 + b1`:
-
-1. factor the left child and obtain `(V0, T0)`;
-2. apply the left transform to the right child;
-3. factor the transformed right child and obtain `(V1, T1)`;
-4. compute the cross term `S = V0^T V1`;
-5. assemble a parent `(V, T)` and apply it once to the far trailing matrix.
+1. factor the left child `(V0, T0)`;
+2. apply its transform to the right child;
+3. factor the transformed right child `(V1, T1)`;
+4. if a far trailing matrix remains, compose a parent `(V, T)` and apply it
+   once at the parent width.
 
 ```mermaid
 flowchart TD
-    P[Parent panel b] --> L[Factor left child b0]
-    L --> VL[V0, T0]
-    VL --> AR[Apply left transform to right child]
-    AR --> R[Factor right child b1]
-    R --> VR[V1, T1]
-    VL --> C[Cross Gram S = V0^T V1]
-    VR --> C
-    C --> PT[Assemble parent V, T]
-    PT --> F[One parent update of far trailing matrix]
+    P[Parent panel] --> L[Factor left leaf]
+    L --> N[Apply left transform to right child]
+    N --> R[Factor right leaf]
+    L --> C[Optional parent WY composition]
+    R --> C
+    C --> U[One far-trailing parent update]
 ```
 
-For
+For the convention
 
 ```math
 Q_0 = I - V_0 T_0 V_0^T, \qquad
 Q_1 = I - V_1 T_1 V_1^T,
 ```
 
-the product `Q = Q0 Q1` can be represented by
+one product representation is
 
 ```math
 V = [V_0, V_1], \qquad
@@ -99,116 +83,198 @@ T_0 & -T_0 (V_0^T V_1) T_1 \\
 \end{bmatrix}.
 ```
 
-The triangular orientation may be transposed in code depending on whether the
-update applies `Q` or `Q^T`; the compact-WY cross term is the same.
+The implementation stores the orientation needed by its `Q`/`Q^T` update,
+so individual code matrices may appear transposed relative to this formula.
 
-Recursion does not change the asymptotic QR flop count. It changes where the
-work runs and how much state is live:
+Recursion does not improve the asymptotic flop count. It changes the GPU work
+distribution:
 
-- sequential work is bounded inside a tuned leaf width;
-- each leaf has a smaller register/shared-memory working set;
+- the serial reflector chain is bounded by a smaller leaf width;
+- leaf state requires fewer registers and less shared memory;
 - cross-child coupling becomes matrix multiplication;
-- the parent transform updates the far trailing matrix as a large block;
-- leaf sizes can be selected for GPU occupancy.
+- an optional parent update replaces multiple far-trailing updates.
 
-The leaf width and crossover must compensate for the extra cross-Gram and
-parent assembly work, so recursion is not automatically faster at every size.
+The extra Gram products, `T` construction, and parent assembly are real costs.
+Recursive Householder is therefore not automatically faster than a flat panel;
+the crossover depends on rows, columns, batch size, and GPU occupancy.
 
-## 3. Mega-panel leaf kernels
+The terminal n512 active tail illustrates a second useful case: it uses
+`96 + 96` leaves but has no far trailing matrix, so it stops after the
+left-to-right near-panel update and right-leaf factorization. It does not build
+an unused 192-column parent.
 
-The leaf factorization uses and adapts the wide-panel CUDA kernels from
-[gau.nernst's QR2 GPU MODE submission](https://www.gpumode.com/leaderboard/774?tab=rankings).
+## 3. Panel megakernels
 
-A leaf is a **mega-panel kernel** because one launch performs many logical
-Householder steps:
+The wide-panel leaf design is adapted from
+[gau.nernst's QR2 submission](https://www.gpumode.com/leaderboard/774?tab=rankings).
+
+A **panel megakernel** is one CUDA launch that fuses several logical QR steps:
 
 ```mermaid
 flowchart LR
-    I[Load panel] --> H[Generate many reflectors]
-    H --> P[Apply all intra-panel updates]
-    P --> O[Emit packed H, tau, FP32 V and internal FP16 V]
+    I[Load panel tile] --> H[Generate many reflectors]
+    H --> P[Apply intra-panel reflectors]
+    P --> O[Write compact H and tau]
+    P --> W[Optionally emit FP32/FP16 update V]
 ```
 
-- multiple reflectors execute inside one kernel launch;
-- reflector state is reused through registers and shared memory;
-- warps cooperate on small column groups inside a wide panel;
-- returned compact factors remain FP32;
-- FP16 `V` is internal, with FP32 accumulation and FP32 output.
+Within a leaf kernel:
 
-The recursive hierarchy currently includes:
+- warps own small groups of columns;
+- reflector state is reused in registers and shared memory;
+- synchronization enforces the reflector dependency chain;
+- terminal leaves compile out update-`V` emission when it is not consumed;
+- returned `H` and `tau` are FP32;
+- optional FP16 `V` copies are internal inputs to Tensor-Core updates with
+  FP32 output/accumulation semantics.
+
+The term does **not** mean that compact-WY construction, every trailing GEMM,
+all recursive levels, and the entire QR call execute in one CUDA kernel. In
+the current implementation those are explicit boundaries chosen so large
+matrix products remain on efficient Tensor-Core library kernels.
+
+It is also not a persistent kernel. A persistent design would keep CTAs
+resident and have them repeatedly consume matrices or tiles from a work queue.
+These panel CTAs finish their assigned panel and exit.
+
+## 4. Current Householder hierarchy
+
+The important production decompositions are:
 
 ```text
-n512:
-    96  -> 48 + 48
-    96  -> 48 + 48
-    128 -> flat mega-panel leaf
-    192 -> 96 + 96
+n352:
+    128-column first panel
+    224-column terminal tail megakernel
+
+n512 full:
+     96 -> 48 + 48
+     96 -> 48 + 48
+    128 -> flat leaf
+    192 -> 96 + 96 terminal node
+
+n512 active384:
+     96 -> 48 + 48
+     96 -> 48 + 48
+    final 320 x 192 subproblem -> 320 x 96 left leaf
+                                + 224 x 96 right terminal leaf
 
 n1024:
     192 -> 96 + 96
-    both leaves write directly into the parent V allocation
+    192 -> 96 + 96
+    five tuned 128-column leaves
 
 n2048:
     256 -> 128 + 128
-    later panels use tuned 128-column leaves
+    remaining panels use tuned 128-column leaves
 ```
 
-CUDA Graph replay packages the leaves, cross-Gram operations, parent assembly,
-and trailing updates into a low-overhead schedule. Graph replay does not make
-the kernels persistent.
+The active384 n512 tail replaces a flat `128 + 64` terminal schedule with a
+recursive `96 + 96` boundary. On the measured rank-deficient case this reduced
+mean latency from roughly 2.37 ms to 2.30 ms while preserving the compact QR
+contract.
 
-## 4. CAQR for the largest shape
+Leaf-level fusion and recursive composition are separate claims:
 
-The `4096 x 4096` case has batch size two, where a scalar Householder panel
-chain underutilizes the GPU. The guarded communication-avoiding route:
+- **fused:** reflector generation, intra-panel update, `tau`, and factor
+  writeback inside each leaf kernel;
+- **composed:** Gram/`T`, left-to-right near update, optional parent assembly,
+  and far update across several kernels.
 
-1. forms a small panel Gram matrix;
-2. performs CholeskyQR-like panel normalization;
-3. reconstructs the standard FP32 packed `(H, tau)` representation;
-4. applies the block transform with level-3 operations;
-5. uses hierarchical `256`, `128`, `64`, and `16` column stages.
+## 5. Compact-WY update boundary
+
+For a nonterminal leaf, the implementation generally performs:
+
+```text
+leaf panel megakernel
+    -> Gram(V)
+    -> small triangular T builder
+    -> projected = V^T @ trailing
+    -> transformed = T @ projected
+    -> trailing -= V @ transformed
+```
+
+Small `T` construction uses specialized CUDA kernels. Larger projections and
+updates use Tensor-Core matrix operations. This is intentional: forcing the
+entire far update into the panel kernel increased live state and reduced
+occupancy in experiments.
+
+## 6. CUDA Graph semantics
+
+The direct recursive schedule contains many dependent launches. Graph capture
+and replay packages that already-defined schedule so repeated calls avoid most
+Python and driver launch gaps.
+
+Graph replay:
+
+- does not change the Householder mathematics;
+- does not merge the captured kernels into one kernel;
+- does not remove dependencies between panel factorization and updates;
+- does not make the kernels persistent;
+- does not, by itself, imply overlap.
+
+Independent batch partitions may be represented as graph child nodes, but the
+performance claim here is launch amortization. The submission does not create
+auxiliary execution streams.
+
+## 7. Heterogeneous conditioning
+
+The mixed n512 benchmark contains matrices with different numerical
+structures at arbitrary batch positions. The implementation classifies every
+matrix in that route, permutes matrices by profile, executes the corresponding
+Householder path, and restores the original order.
+
+This is not a claim that all routes use one numerical algorithm. It is a claim
+that the heterogeneous route does not inspect a few representatives and apply
+an unsafe whole-batch decision. Correctness is still checked independently for
+every matrix against the original FP32 input.
+
+## 8. Guarded n4096 large-matrix path
+
+Calling the n4096 path simply “CAQR” is too broad. More precisely, it is a
+**guarded Gram/CholeskyQR-style micro-panel factorization with Householder
+compact-factor reconstruction and recursive block composition**.
+
+For a safe 64-column micro-panel it:
+
+1. forms `A_p^T A_p`;
+2. computes an FP32 Cholesky factor;
+3. derives a normalized panel representation;
+4. reconstructs standard FP32 Householder `H`, `tau`, `V`, and `T` data;
+5. composes 64-column children into 128- and 256-column blocks;
+6. applies those block transforms to the trailing matrix.
 
 ```mermaid
 flowchart LR
-    G[Conditioning guard] -->|safe| C[CAQR panel factorization]
-    C --> R[Reconstruct packed Householder H, tau]
-    R --> U[Block trailing update]
-    G -->|unsafe| F[Stable fallback]
+    G[Conditioning guard] -->|safe benchmark profile| C[Gram and Cholesky micro-panel]
+    C --> H[Reconstruct compact Householder factors]
+    H --> R[Compose 128/256-column blocks]
+    R --> U[Trailing update]
+    G -->|unsafe| F[Stable torch.geqrf fallback]
 ```
 
-The guard is essential because Gram/Cholesky normalization can lose accuracy
-for poorly conditioned or nearly rank-deficient inputs. CAQR is selected only
-for profiles that satisfy the original FP32 residual and orthogonality gates.
+This is CAQR-inspired in its communication-avoiding block structure, but it
+is not TSQR and should not be presented as a general, unguarded CAQR solver.
+The Gram/Cholesky step squares the condition number, so the guard is part of
+the algorithm's numerical domain, not merely a performance heuristic.
 
-## 5. Comparison
+## 9. Terminology summary
 
-| Property | Flat blocked Householder | Recursive Householder here | Guarded CAQR | Persistent kernel |
-|---|---|---|---|---|
-| Decomposition | One flat panel | Divide-and-compose panel tree | Communication-avoiding blocks | Any algorithm with resident workers |
-| Sequential work | Across full panel | Bounded inside leaves | Reduced with block operations | Algorithm-dependent |
-| GPU strength | Large trailing GEMM | Tuned leaves plus GEMM composition | High utilization at tiny batch | Avoid repeated scheduling/reloads |
-| Numerical scope | General Householder | General Householder paths | Guarded safe profiles | Not a numerical method |
-| Role here | Baseline | Main n512/n1024/n2048 extension | Specialized n4096 route | Not used |
+| Term | Accurate use in this repository |
+|---|---|
+| Householder QR | The returned FP32 `(H, tau)` contract and the main paths |
+| Blocked Householder | Flat leaf plus compact-WY trailing update |
+| Recursive Householder | Split children, near update, optional parent composition |
+| Panel megakernel | One launch fusing many reflector and intra-panel steps |
+| Recursive megakernel node | Not fully single-kernel in the current implementation |
+| CUDA Graph | Replay/launch-amortization mechanism around a kernel DAG |
+| Persistent kernel | Not used |
+| CAQR | Only shorthand for the guarded n4096 hybrid; not textbook TSQR |
 
-A persistent kernel keeps a fixed set of CTAs resident and repeatedly pulls
-matrices, panels, or tiles from a work queue. Our panel CTAs finish their
-assigned panel and exit. The correct description is **recursive Householder QR
-with mega-panel leaf kernels**, not persistent QR.
+## 10. Scope
 
-## 6. End-to-end execution
-
-```mermaid
-flowchart TD
-    A[FP32 input batch] --> P[Per-matrix/profile probe]
-    P --> RH[Recursive Householder path]
-    P --> CQ[Guarded n4096 CAQR path]
-    RH --> M[Mega-panel leaf kernels]
-    M --> X[Cross Gram and parent T assembly]
-    X --> B[Large trailing updates]
-    CQ --> B
-    B --> O[FP32 compact H, tau]
-```
-
-The mixed benchmark interleaves conditioning profiles at arbitrary batch
-positions. Routing must therefore preserve correctness per matrix rather than
-infer one numerical path for the whole batch from a few samples.
+The implementation is benchmark-shape-specialized. Its optimized routes cover
+the seven public `(batch, n)` combinations and the associated conditioning
+profiles. Other square CUDA FP32 shapes fall back to `torch.geqrf` for
+correctness. The measured 0.948304 ms geometric mean describes the supplied
+12-case suite on the tested GB200 environment; it is not a general QR
+complexity or portability claim.
