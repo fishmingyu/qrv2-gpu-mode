@@ -1,8 +1,10 @@
-# QR2 Recursive Householder Panel Megakernels
+# QR2 Shape-Specialized Householder Megakernels
 
 A shape-specialized batched FP32 QR implementation for NVIDIA Blackwell GPUs.
-It returns the LAPACK/PyTorch compact Householder representation `(H, tau)`
-used by `torch.geqrf`.
+The small n32 and n176 routes use full-matrix megakernels; larger Householder
+routes use fused panel megakernels inside blocked or recursive factorizations.
+The implementation returns the LAPACK/PyTorch compact Householder
+representation `(H, tau)` used by `torch.geqrf`.
 
 ## Provenance
 
@@ -14,7 +16,8 @@ internal symbols use project-local names.
 
 This repository adds and evaluates:
 
-- recursive Householder panel decomposition above those leaf kernels;
+- full-matrix n32 and n176 Householder megakernels;
+- recursive Householder panel decomposition for larger shapes;
 - terminal-tail specializations, including the n512 active `96 + 96` tail;
 - compact-WY construction and Tensor-Core near/far updates;
 - per-matrix handling of heterogeneous n512 batches;
@@ -27,15 +30,28 @@ wide-panel kernel design as independent work.
 
 ## What “megakernel” means here
 
-“Megakernel” describes a deliberate **panel fusion boundary**, not the whole
-QR call. A leaf launch loads a multi-column panel and performs the sequential
-Householder reflector chain, intra-panel updates, `tau` generation, and factor
-writeback inside one CUDA kernel.
+“Megakernel” describes the CUDA kernel that fuses a complete Householder panel:
+it loads the panel and performs the sequential reflector chain, intra-panel
+updates, `tau` generation, and factor writeback in one launch. For n32 and
+n176, that panel is the complete square matrix, so the QR factorization itself
+is a full-matrix megakernel. The n176 launch uses a two-CTA cluster. The normal
+n32 execution wrapper replays a two-node input-copy-plus-kernel CUDA Graph,
+but the numerical factorization is still one kernel.
 
-A recursive node is broader than one leaf. It is currently composed from leaf
-megakernels, small `T` builders, and Tensor-Core `bmm`/`baddbmm` operations.
-The complete recursive node and the complete factorization are therefore not
-single monolithic CUDA kernels.
+For n352 and larger Householder routes, the fused panel is only a leaf of the
+complete factorization. A recursive node is broader than one leaf: it is
+composed from leaf megakernels, small `T` builders, and Tensor-Core
+`bmm`/`baddbmm` operations. The complete recursive node and factorization are
+therefore not single monolithic CUDA kernels.
+
+The execution boundaries are shape-specific:
+
+| Route | Factorization boundary | CUDA Graph replay | PDL |
+|---|---|---:|---:|
+| n32 | full-matrix megakernel | input copy + QR kernel | QR kernel |
+| n176 | full-matrix two-CTA-cluster megakernel | no | no |
+| n352, n512, n1024, n2048 | panel megakernels in a multi-kernel DAG | yes | not generally |
+| guarded n4096 | Gram/CholeskyQR-style multi-kernel DAG | yes | no |
 
 This implementation is also **not persistent**: its CTAs factor fixed panels
 and exit; they do not remain resident and pull work from a long-lived queue.
@@ -44,11 +60,18 @@ CUDA Graph replay reduces host/driver launch gaps. It does not fuse kernels,
 remove mathematical dependencies, or by itself prove execution overlap. The
 submission creates no auxiliary execution streams.
 
+PDL is not a blanket property of the larger recursive routes. It is enabled
+for the n32 QR kernel and for a specialized n1024 near-rank-deficient tail-pack
+launch; the main n1024 panel/update DAG, and the n2048 and guarded n4096 routes,
+should be described as CUDA Graph schedules rather than uniformly as
+“CUDA Graph + PDL.”
+
 The concise description is:
 
-> Recursive Householder QR built from fused panel megakernels, compact-WY
-> composition, and Tensor-Core trailing updates, with a guarded
-> CholeskyQR-style large-matrix specialization.
+> Shape-specialized Householder QR with full-matrix n32/n176 megakernels and
+> larger blocked or recursive factorizations built from fused panel
+> megakernels, compact-WY composition, Tensor-Core trailing updates, and CUDA
+> Graph replay, plus a guarded CholeskyQR-style n4096 specialization.
 
 See [ALGORITHM.md](ALGORITHM.md) for the mathematical and implementation
 boundaries.
